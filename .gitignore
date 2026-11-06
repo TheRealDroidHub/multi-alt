@@ -1,0 +1,4 @@
+# build output goes in GitHub Releases, not the repo
+*.exe
+*.tmp
+logo-source.jpg
