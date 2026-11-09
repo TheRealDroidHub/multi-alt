@@ -29,6 +29,7 @@ public class Account
     public string Username { get; set; }
     public string DisplayName { get; set; }
     public string Password { get; set; }     // optional, only if the user saves it for "Copy combo"; encrypted with the rest
+    public bool Skip { get; set; }           // unticked: "Launch all" and Follow/Join leave it out
 }
 
 public class AppSettings
@@ -40,10 +41,13 @@ public class AppSettings
     public string PlaceId { get; set; }
     public bool Windowed { get; set; }
     public bool AntiAfkEnabled { get; set; }   // off by default (new name so older builds' "on" default is dropped)
-    public AppSettings() { LowPriorityBackground = true; LaunchDelaySec = 5; PlaceId = ""; }
+    public bool AutoRejoin { get; set; }       // off by default
+    public bool MuteRoblox { get; set; }
+    public bool CheckUpdates { get; set; }
+    public AppSettings() { LowPriorityBackground = true; LaunchDelaySec = 5; PlaceId = ""; CheckUpdates = true; }
 }
 
-class Client { public int Pid; public IntPtr Hwnd; public long Ram; public Account Account; }
+class Client { public int Pid; public IntPtr Hwnd; public long Ram; public double Cpu; public Account Account; }
 
 static class Store
 {
@@ -94,6 +98,37 @@ static class Store
         File.WriteAllBytes(tmp, data);
         if (File.Exists(path)) File.Replace(tmp, path, null); else File.Move(tmp, path);
     }
+
+    // Overwrites a file with random bytes before deleting it, so recovery tools can't bring it back.
+    public static void Shred(string f)
+    {
+        try
+        {
+            var junk = new byte[new FileInfo(f).Length];
+            using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(junk);
+            using (var fs = new FileStream(f, FileMode.Open, FileAccess.Write, FileShare.None)) { fs.Write(junk, 0, junk.Length); fs.Flush(true); }
+            File.Delete(f);
+        }
+        catch { }
+    }
+
+    // Deletes everything Multi Alt saved (shredding the logins first). Returns folders that couldn't be fully removed.
+    public static List<string> Burn()
+    {
+        var left = new List<string>();
+        foreach (var dir in new[] { Dir, Path.GetDirectoryName(OldAccountsFile) })
+        {
+            if (!Directory.Exists(dir)) continue;
+            foreach (var f in Directory.GetFiles(dir, "accounts.dat*")) Shred(f);
+            for (int i = 0; i < 10; i++)
+            {
+                try { Directory.Delete(dir, true); break; }
+                catch { Thread.Sleep(300); } // a closing browser can hold its profile for a moment
+            }
+            if (Directory.Exists(dir)) left.Add(dir);
+        }
+        return left;
+    }
 }
 
 static class RobloxApi
@@ -101,7 +136,7 @@ static class RobloxApi
     public static string Http(string url, string cookie)
     {
         var req = (HttpWebRequest)WebRequest.Create(url);
-        req.UserAgent = "MultiAlt/1.0";
+        req.UserAgent = "MultiAlt/" + Program.Version;
         req.Timeout = 15000;
         if (cookie != null) req.Headers.Add("Cookie", ".ROBLOSECURITY=" + cookie);
         try
@@ -121,6 +156,25 @@ static class RobloxApi
     {
         var d = Store.Json.Deserialize<Dictionary<string, object>>(Http("https://users.roblox.com/v1/users/authenticated", cookie));
         return new Account { UserId = Convert.ToInt64(d["id"]), Username = (string)d["name"], DisplayName = (string)d["displayName"] };
+    }
+
+    // Username -> user ID (0 if no such user). Public endpoint, no login sent.
+    public static long UserIdFor(string username)
+    {
+        var body = Encoding.UTF8.GetBytes(Store.Json.Serialize(new Dictionary<string, object> { { "usernames", new[] { username } }, { "excludeBannedUsers", true } }));
+        var req = (HttpWebRequest)WebRequest.Create("https://users.roblox.com/v1/usernames/users");
+        req.Method = "POST";
+        req.ContentType = "application/json";
+        req.UserAgent = "MultiAlt/" + Program.Version;
+        req.Timeout = 15000;
+        using (var s = req.GetRequestStream()) s.Write(body, 0, body.Length);
+        using (var resp = req.GetResponse())
+        using (var sr = new StreamReader(resp.GetResponseStream()))
+        {
+            var d = Store.Json.Deserialize<Dictionary<string, object>>(sr.ReadToEnd());
+            foreach (var o in (System.Collections.IEnumerable)d["data"]) return Convert.ToInt64(((Dictionary<string, object>)o)["id"]);
+        }
+        return 0;
     }
 
     // Headshots in batches of 100 (the API max), saved to avatars\<userId>.png.
@@ -162,7 +216,7 @@ static class RobloxApi
             req.Method = "POST";
             req.ContentType = "application/json";
             req.Accept = "application/json";
-            req.UserAgent = "MultiAlt/1.0";
+            req.UserAgent = "MultiAlt/" + Program.Version;
             req.Referer = "https://www.roblox.com/";
             req.Headers.Add("Cookie", ".ROBLOSECURITY=" + cookie);
             if (csrf != "") req.Headers.Add("X-CSRF-TOKEN", csrf);
@@ -192,16 +246,16 @@ static class RobloxApi
         throw new Exception("could not get a launch ticket.");
     }
 
-    public static string BuildUri(string ticket, string placeId)
+    // query: "" = Roblox home, else a PlaceLauncher request from Program.ParseTarget or a follow ("request=RequestFollowUser&userId=...").
+    public static string BuildUri(string ticket, string query)
     {
         var rng = new Random();
         var tracker = rng.Next(100000, 999999).ToString() + rng.Next(100000, 999999);
         var time = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var uri = "roblox-player:1+gameinfo:" + ticket + "+launchtime:" + time + "+browsertrackerid:" + tracker
                 + "+robloxLocale:en_us+gameLocale:en_us+channel:";
-        if (string.IsNullOrWhiteSpace(placeId)) return uri + "+launchmode:app";
-        var launcher = "https://www.roblox.com/Game/PlaceLauncher.ashx?request=RequestGame&browserTrackerId=" + tracker
-                     + "&placeId=" + placeId.Trim() + "&isPlayTogetherGame=false";
+        if (string.IsNullOrEmpty(query)) return uri + "+launchmode:app";
+        var launcher = "https://www.roblox.com/Game/PlaceLauncher.ashx?" + query + "&browserTrackerId=" + tracker + "&isPlayTogetherGame=false";
         return uri + "+launchmode:play+placelauncherurl:" + Uri.EscapeDataString(launcher) + "+LaunchExp:InApp";
     }
 }
@@ -353,6 +407,72 @@ static class FpsTweak
             catch { } // a broken user-edited file is left alone
         }
         return n;
+    }
+}
+
+// "Mute Roblox": the same per-app mute as the Windows volume mixer (Core Audio). Nothing touches Roblox itself.
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorCom { }
+[ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceEnumerator { [PreserveSig] int EnumAudioEndpoints(int flow, int stateMask, out IMMDeviceCollection devices); }
+[ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceCollection { [PreserveSig] int GetCount(out uint n); [PreserveSig] int Item(uint i, out IMMDevice device); }
+[ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDevice { [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr p, [MarshalAs(UnmanagedType.IUnknown)] out object o); }
+[ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioSessionManager2
+{
+    [PreserveSig] int GetAudioSessionControl(IntPtr g, int flags, out IntPtr c);
+    [PreserveSig] int GetSimpleAudioVolume(IntPtr g, int flags, out IntPtr v);
+    [PreserveSig] int GetSessionEnumerator(out IAudioSessionEnumerator e);
+}
+[ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioSessionEnumerator { [PreserveSig] int GetCount(out int n); [PreserveSig] int GetSession(int i, out IAudioSessionControl2 s); }
+[ComImport, Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioSessionControl2
+{
+    void R1(); void R2(); void R3(); void R4(); void R5(); void R6(); void R7(); void R8(); void R9(); // IAudioSessionControl slots (unused)
+    void R10(); void R11();                                                                        // session identifiers (unused)
+    [PreserveSig] int GetProcessId(out uint pid);
+}
+[ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface ISimpleAudioVolume
+{
+    [PreserveSig] int SetMasterVolume(float v, ref Guid ctx);
+    [PreserveSig] int GetMasterVolume(out float v);
+    [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, ref Guid ctx);
+    [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
+}
+
+static class RobloxAudio
+{
+    // Mutes or unmutes every audio session these processes own, on every active speaker/headset.
+    public static void SetMute(HashSet<int> pids, bool mute)
+    {
+        if (pids.Count == 0) return;
+        IMMDeviceCollection devs;
+        if (((IMMDeviceEnumerator)new MMDeviceEnumeratorCom()).EnumAudioEndpoints(0 /*render*/, 1 /*active*/, out devs) != 0) return;
+        uint n;
+        devs.GetCount(out n);
+        var iid = typeof(IAudioSessionManager2).GUID;
+        for (uint i = 0; i < n; i++)
+        {
+            IMMDevice dev;
+            object o;
+            IAudioSessionEnumerator sessions;
+            int count;
+            if (devs.Item(i, out dev) != 0 || dev.Activate(ref iid, 23 /*CLSCTX_ALL*/, IntPtr.Zero, out o) != 0) continue;
+            if (((IAudioSessionManager2)o).GetSessionEnumerator(out sessions) != 0 || sessions.GetCount(out count) != 0) continue;
+            for (int k = 0; k < count; k++)
+            {
+                IAudioSessionControl2 s;
+                uint pid;
+                bool now;
+                if (sessions.GetSession(k, out s) != 0 || s.GetProcessId(out pid) != 0 || !pids.Contains((int)pid)) continue;
+                var vol = (ISimpleAudioVolume)s;
+                var ctx = Guid.Empty;
+                if (vol.GetMute(out now) == 0 && now != mute) vol.SetMute(mute, ref ctx);
+            }
+        }
     }
 }
 
@@ -562,6 +682,13 @@ class MainForm : Form
     readonly Dictionary<int, Account> pidAccount = new Dictionary<int, Account>();
     volatile List<Client> clients = new List<Client>();
     long robloxRam;
+    double robloxCpu;                                                 // written by Poll, read for display
+    Dictionary<int, TimeSpan> cpuPrev = new Dictionary<int, TimeSpan>(); // Poll thread only
+    DateTime cpuAt = DateTime.UtcNow;
+    readonly Dictionary<Account, string> targetFor = new Dictionary<Account, string>(); // where a queued launch goes; null = the Game link box
+    // Auto-rejoin state, UI thread only.
+    readonly HashSet<Account> userClosed = new HashSet<Account>(), rejoinStopped = new HashSet<Account>();
+    readonly Dictionary<Account, List<DateTime>> rejoins = new Dictionary<Account, List<DateTime>>();
     readonly long installedRam = (long)new Microsoft.VisualBasic.Devices.ComputerInfo().TotalPhysicalMemory;
     readonly BlockingCollection<Account> launchQueue = new BlockingCollection<Account>();
     readonly Dictionary<IntPtr, IntPtr> thumbs = new Dictionary<IntPtr, IntPtr>();
@@ -606,6 +733,12 @@ class MainForm : Form
         var kill = new NavItem("Kill all Roblox") { Bounds = new Rectangle(0, D(100) + names.Length * D(50), D(240), D(48)), TextColor = Color.FromArgb(200, 55, 65) };
         kill.Click += (s, e) => KillAll();
         side.Controls.Add(kill);
+        // Docked to the bottom in this order: update button, then version, then Terms of Service underneath.
+        updateBtn = new NavItem("Update available") { Dock = DockStyle.Bottom, Height = D(44), TextColor = Theme.Gold, Visible = false };
+        updateBtn.Click += (s, e) => { if (updateBtn.Tag is string) Process.Start((string)updateBtn.Tag); };
+        side.Controls.Add(updateBtn);
+        side.Controls.Add(new Label { Text = "v" + Program.Version, Dock = DockStyle.Bottom, Height = D(20), TextAlign = ContentAlignment.MiddleCenter,
+                                      ForeColor = Theme.Muted, Font = new Font("Segoe UI", 8.5f) });
         var tos = new Label { Text = "Terms of Service", Dock = DockStyle.Bottom, Height = D(40), TextAlign = ContentAlignment.MiddleCenter,
                               ForeColor = Theme.Muted, Font = new Font("Segoe UI", 9.5f, FontStyle.Underline), Cursor = Cursors.Hand };
         tos.MouseEnter += (s, e) => tos.ForeColor = Theme.Fg;
@@ -641,6 +774,21 @@ class MainForm : Form
     }
 
     Button sizeBtn;
+    NavItem updateBtn;
+
+    // Asks GitHub for the newest release number only; nothing about you or your accounts is sent. Never downloads anything.
+    void CheckForUpdate()
+    {
+        try
+        {
+            var d = Store.Json.Deserialize<Dictionary<string, object>>(RobloxApi.Http("https://api.github.com/repos/TheRealDroidHub/multi-alt/releases/latest", null));
+            var tag = d["tag_name"] as string;
+            var url = d["html_url"] as string;
+            if (!Program.IsNewer(tag, Program.Version) || url == null || !url.StartsWith("https://github.com/TheRealDroidHub/multi-alt/")) return;
+            BeginInvoke((Action)(() => { updateBtn.Text = "Update available (" + tag + ")"; updateBtn.Tag = url; updateBtn.Visible = true; }));
+        }
+        catch { } // offline or GitHub down: just no button
+    }
 
     const string Terms = @"MULTI ALT - TERMS OF SERVICE AND DISCLAIMER
 Developer: Triple DDD
@@ -651,14 +799,14 @@ By downloading, installing or using Multi Alt (""the Software"") you agree to th
 Multi Alt is a free, standalone account manager and multi-instance launcher. It lets you sign in to your own Roblox accounts, keep them in one place, and run more than one official Roblox client at the same time on your own computer. That is all it does.
 
 2. WHAT MULTI ALT DOES NOT DO
-Multi Alt does not inject code into, modify, read the memory of, or tamper with the Roblox client or any game. It contains no exploits, cheats, scripts, bots, macros, malware, spyware or tracking of any kind. It does not automate gameplay (see section 3 for the optional Anti-AFK setting). It starts the official Roblox client the same way the Roblox website does, and shows previews of those windows using standard Windows features. The optional FPS cap edits Roblox's own client settings file on your computer, which you can turn off at any time.
+Multi Alt does not inject code into, modify, read the memory of, or tamper with the Roblox client or any game. It contains no exploits, cheats, scripts, bots, macros, malware, spyware or tracking of any kind. It does not automate gameplay (see section 3 for the optional Anti-AFK setting). It starts the official Roblox client the same way the Roblox website does, and shows previews of those windows using standard Windows features. The optional FPS cap edits Roblox's own client settings file on your computer, which you can turn off at any time. The optional Auto-rejoin setting (off by default) only relaunches the official Roblox client when one closes by itself, at most 2 times per account in 8 minutes. The optional Mute Roblox setting uses the standard Windows volume mixer.
 
 3. ANTI-AFK (OFF BY DEFAULT)
 Anti-AFK is turned OFF by default. You choose whether to use it. When you turn it on, every 15 minutes Multi Alt briefly switches to each idle Roblox window and presses the Space key once, the same as you tapping Space on your own keyboard. This keeps Roblox from disconnecting you for being idle. It is simple keyboard input emulation only: it does not inject scripts or code into Roblox or any game, does not read or change game memory, and does not play the game for you. It waits until you are not using your mouse or keyboard, skips the window you are playing, and never presses a key unless a Roblox window is in focus.
 How to turn it on or off: open the Performance tab in the sidebar and tick or untick ""Anti-AFK"". You can also press the ""Anti-AFK setting"" button at the bottom of this window to go straight there. Some games or servers may have their own rules about staying idle; using Anti-AFK is at your own discretion and risk (see sections 5 to 7).
 
 4. YOUR ACCOUNT DATA
-Your account login cookies are stored only on your own computer, encrypted with Windows' built-in data protection for your Windows user. They are sent only to official Roblox servers (roblox.com) to sign you in and launch games. Triple DDD never receives, collects, sells or shares your account data. Never share your accounts.dat file or your login cookies with anyone.
+Your account login cookies are stored only on your own computer, encrypted with Windows' built-in data protection for your Windows user. They are sent only to official Roblox servers (roblox.com) to sign you in and launch games. Triple DDD never receives, collects, sells or shares your account data. Never share your accounts.dat file or your login cookies with anyone. If the update check is on (Settings), Multi Alt asks api.github.com for the latest version number when it starts; no account data is sent and nothing is downloaded.
 
 5. USE AT YOUR OWN RISK
 The Software is provided ""AS IS"", without warranty of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose and non-infringement. You use it entirely at your own risk and discretion.
@@ -722,6 +870,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
         new Thread(LaunchWorker) { IsBackground = true }.Start();
         new Thread(RefreshAccountInfo) { IsBackground = true }.Start();
         new Thread(AntiAfkLoop) { IsBackground = true, Priority = ThreadPriority.BelowNormal }.Start();
+        if (settings.CheckUpdates) new Thread(CheckForUpdate) { IsBackground = true }.Start();
         if (settings.FpsCap > 0) new Thread(() => FpsTweak.Apply(settings.FpsCap)) { IsBackground = true }.Start(); // Roblox updates make new version folders
         poller = new System.Threading.Timer(_ => Poll(), null, 300, 2000);
     }
@@ -729,6 +878,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         if (poller != null) poller.Dispose();
+        if (settings.MuteRoblox) try { RobloxAudio.SetMute(RobloxPids(), false); } catch { } // Windows can remember per-app mute; don't leave Roblox silent
         // Give running clients their taskbar buttons back and bring them onto the main screen, cascaded.
         var wa = Screen.PrimaryScreen.WorkingArea;
         int n = 0;
@@ -791,7 +941,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
         foreach (var h in thumbs.Keys.Where(h => !liveSet.Contains(h)).ToList()) { DwmUnregisterThumbnail(thumbs[h]); thumbs.Remove(h); }
 
         homeClients = live;
-        homeCells = Grid.Fit(live.Count, grid.ClientSize.Width - D(16), grid.ClientSize.Height - D(8), D(10), D(24), D(560));
+        homeCells = Grid.Fit(live.Count, grid.ClientSize.Width - D(16), grid.ClientSize.Height - D(8), D(10), D(Strip), D(560));
         for (int i = 0; i < homeCells.Count; i++) homeCells[i] = new Rectangle(homeCells[i].X + D(16), homeCells[i].Y, homeCells[i].Width, homeCells[i].Height);
         bool show = page == 0 && WindowState != FormWindowState.Minimized;
         var off = PointToClient(grid.PointToScreen(Point.Empty));
@@ -804,7 +954,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
                 thumbs[live[i].Hwnd] = t;
             }
             var cell = homeCells[i];
-            var box = new Rectangle(cell.X + off.X + D(4), cell.Y + off.Y + D(4), cell.Width - D(8), cell.Height - D(24) - D(4));
+            var box = new Rectangle(cell.X + off.X + D(4), cell.Y + off.Y + D(4), cell.Width - D(8), cell.Height - D(Strip) - D(4));
             PSIZE src;
             if (DwmQueryThumbnailSourceSize(t, out src) == 0 && src.X > 0 && src.Y > 0) // letterbox, keep aspect
             {
@@ -817,11 +967,12 @@ These terms may be updated with new versions of the Software. Continuing to use 
         }
         nav[0].Count = live.Count > 0 ? live.Count.ToString() : "";
         nav[0].Invalidate();
-        homeInfo.Text = live.Count + " running  •  Roblox using " + Gb(Interlocked.Read(ref robloxRam)) + " GB of " + Gb(installedRam)
-            + " GB  •  click a window to play it, right-click to close it  •  click the sidebar to come back here";
+        homeInfo.Text = live.Count + " running  •  Roblox using " + Gb(Interlocked.Read(ref robloxRam)) + " / " + Gb(installedRam) + " GB RAM  •  "
+            + robloxCpu.ToString("0") + "% CPU  •  click a window to play it, right-click to close it  •  click the sidebar to come back here";
         grid.Invalidate();
     }
 
+    const int Strip = 40; // label area under each Home preview: name + PID, and CPU over RAM on the right
     static string Gb(long bytes) { return (bytes / (double)GB).ToString("0.0"); }
 
     void PaintGrid(object s, PaintEventArgs e)
@@ -838,12 +989,17 @@ These terms may be updated with new versions of the Software. Continuing to use 
         {
             var c = homeCells[i];
             Theme.FillRound(g, Theme.Card, c, D(8));
-            var who = homeClients[i].Account;
-            var name = who == null ? "Roblox · " + homeClients[i].Pid : Title(who) + (string.IsNullOrEmpty(who.Username) ? "" : "  @" + who.Username);
-            var label = new Rectangle(c.X + D(8), c.Bottom - D(24), c.Width - D(16), D(22));
-            TextRenderer.DrawText(g, name, fSmall, label, Theme.Fg, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
-            if (c.Width > D(140))
-                TextRenderer.DrawText(g, Gb(homeClients[i].Ram) + " GB", fSmall, label, Theme.Muted, TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+            var cl = homeClients[i];
+            var who = cl.Account;
+            var name = (who == null ? "Roblox" : Title(who) + (string.IsNullOrEmpty(who.Username) ? "" : "  @" + who.Username)) + "  PID=" + cl.Pid;
+            var strip = new Rectangle(c.X + D(8), c.Bottom - D(Strip), c.Width - D(16), D(Strip - 2));
+            bool stats = c.Width > D(140);
+            TextRenderer.DrawText(g, name, fSmall, new Rectangle(strip.X, strip.Y, strip.Width - (stats ? D(70) : 0), strip.Height), Theme.Fg,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            if (!stats) continue;
+            var half = strip.Height / 2;
+            TextRenderer.DrawText(g, cl.Cpu.ToString("0") + "% CPU", fSmall, new Rectangle(strip.X, strip.Y, strip.Width, half), Theme.Muted, TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+            TextRenderer.DrawText(g, Gb(cl.Ram) + " GB", fSmall, new Rectangle(strip.X, strip.Y + half, strip.Width, half), Theme.Muted, TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
         }
     }
 
@@ -856,7 +1012,11 @@ These terms may be updated with new versions of the Software. Continuing to use 
         {
             var menu = new ContextMenuStrip();
             menu.Items.Add("Play this window", null, (a, b) => FocusClient(c.Hwnd));
-            menu.Items.Add("Close this client", null, (a, b) => { try { Process.GetProcessById(c.Pid).Kill(); } catch { } });
+            menu.Items.Add("Close this client", null, (a, b) =>
+            {
+                if (c.Account != null) userClosed.Add(c.Account); // you closed it, so auto-rejoin leaves it closed
+                try { Process.GetProcessById(c.Pid).Kill(); } catch { }
+            });
             menu.Show(grid, e.Location);
         }
         else FocusClient(c.Hwnd);
@@ -888,6 +1048,10 @@ These terms may be updated with new versions of the Software. Continuing to use 
             var windows = TopWindows(pids, mainByPid);
             var list = new List<Client>();
             long total = 0;
+            double cpuTotal = 0;
+            var now = DateTime.UtcNow;
+            double cpuSpan = (now - cpuAt).TotalSeconds * Environment.ProcessorCount; // 100% = every core busy
+            var cpuNow = new Dictionary<int, TimeSpan>();
             foreach (var p in procs)
             {
                 try
@@ -896,6 +1060,11 @@ These terms may be updated with new versions of the Software. Continuing to use 
                     mainByPid.TryGetValue(p.Id, out hwnd);
                     var c = new Client { Pid = p.Id, Hwnd = hwnd, Ram = p.WorkingSet64 };
                     lock (pidAccount) pidAccount.TryGetValue(p.Id, out c.Account);
+                    // CPU % = processor time used since the last poll; Windows already counts it, so this costs nothing.
+                    TimeSpan used = p.TotalProcessorTime, prev;
+                    cpuNow[p.Id] = used;
+                    if (cpuSpan > 0 && cpuPrev.TryGetValue(p.Id, out prev)) c.Cpu = Math.Max(0, (used - prev).TotalSeconds / cpuSpan * 100);
+                    cpuTotal += c.Cpu;
                     list.Add(c);
                     total += c.Ram;
                     bool background = settings.LowPriorityBackground && p.Id != fgPid;
@@ -909,9 +1078,15 @@ These terms may be updated with new versions of the Software. Continuing to use 
             if (cap > 0 && total > cap) // over the cap: push background clients' memory out to the page file
                 foreach (var p in procs) if (p.Id != fgPid) try { EmptyWorkingSet(p.Handle); } catch { }
             foreach (var p in procs) p.Dispose();
+            cpuPrev = cpuNow;
+            cpuAt = now;
+            robloxCpu = cpuTotal;
+            if (settings.MuteRoblox) try { RobloxAudio.SetMute(pids, true); } catch { } // repeats: a client only gets its audio session once a game starts
 
+            var died = new List<Account>();
             lock (pidAccount)
-                foreach (var dead in pidAccount.Keys.Where(k => !pids.Contains(k)).ToList()) pidAccount.Remove(dead);
+                foreach (var dead in pidAccount.Keys.Where(k => !pids.Contains(k)).ToList()) { died.Add(pidAccount[dead]); pidAccount.Remove(dead); }
+            if (died.Count > 0 && IsHandleCreated && !IsDisposed) BeginInvoke((Action)(() => ClientsDied(died)));
 
             // New Roblox windows: take them off the taskbar and park them off-screen; they live in Home.
             bool fresh = false;
@@ -951,18 +1126,32 @@ These terms may be updated with new versions of the Software. Continuing to use 
     Panel BuildAccounts()
     {
         var p = new Panel { BackColor = Theme.Bg };
-        var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = D(54), Padding = new Padding(D(18), D(6), 0, 0), BackColor = Theme.Bg };
+        var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = D(100), Padding = new Padding(D(18), D(6), 0, 0), BackColor = Theme.Bg };
         bar.Controls.Add(Theme.Btn("+  Add account", Theme.Gold, AddAccountDialog));
         bar.Controls.Add(Theme.Btn("Login via Roblox", Theme.Blue, (s, e) => LoginViaRoblox()));
-        bar.Controls.Add(Theme.Btn("▶  Launch all", Theme.Card, (s, e) => QueueLaunch(accounts.ToList())));
+        bar.Controls.Add(Theme.Btn("▶  Launch all", Theme.Card, (s, e) =>
+        {
+            var ticked = accounts.Where(a => !a.Skip).ToList();
+            if (ticked.Count == 0) status.Text = "No accounts are ticked. Tick the box on the left of a card to include it in Launch all.";
+            else QueueLaunch(ticked);
+        }));
         bar.Controls.Add(Theme.Btn("■  Stop launching", Theme.Card, (s, e) => { StopLaunching(); status.Text = "Launch queue cleared."; }));
         var lp = Theme.Lbl("Game link / Place ID", 10, Theme.Muted); lp.Margin = new Padding(D(12), D(8), D(6), 0);
         var placeBox = new TextBox { Width = D(320), Text = settings.PlaceId, BackColor = Theme.Card, ForeColor = Theme.Fg, BorderStyle = BorderStyle.FixedSingle, Margin = new Padding(0, D(5), 0, 0) };
         placeBox.TextChanged += (s, e) => { settings.PlaceId = placeBox.Text.Trim(); Store.SaveSettings(settings); };
         bar.Controls.Add(lp);
         bar.Controls.Add(placeBox);
-        var hint = Theme.Lbl("(empty = opens Roblox home)", 9, Theme.Muted); hint.Margin = new Padding(D(6), D(9), 0, 0);
+        var hint = Theme.Lbl("(game link, place ID or private server link; empty = opens Roblox home)", 9, Theme.Muted); hint.Margin = new Padding(D(6), D(9), 0, 0);
         bar.Controls.Add(hint);
+        bar.SetFlowBreak(hint, true);
+        var lf = Theme.Lbl("Follow/Join", 10, Theme.Muted); lf.Margin = new Padding(0, D(8), D(6), 0);
+        var followBox = new TextBox { Width = D(240), BackColor = Theme.Card, ForeColor = Theme.Fg, BorderStyle = BorderStyle.FixedSingle, Margin = new Padding(0, D(5), 0, 0) };
+        var join = Theme.Btn("Join", Theme.Blue, (s, e) => FollowJoin(followBox.Text));
+        join.Margin = new Padding(D(8), D(1), 0, 0);
+        followBox.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; FollowJoin(followBox.Text); } };
+        var fh = Theme.Lbl("(username or user ID: ticked accounts that aren't running join the game that player is in)", 9, Theme.Muted);
+        fh.Margin = new Padding(D(6), D(9), 0, 0);
+        bar.Controls.AddRange(new Control[] { lf, followBox, join, fh });
 
         list = new ListBox { Dock = DockStyle.Fill, DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = Math.Min(255, D(84)), BackColor = Theme.Bg, BorderStyle = BorderStyle.None, IntegralHeight = false };
         list.DrawItem += DrawAccount;
@@ -1040,10 +1229,12 @@ These terms may be updated with new versions of the Software. Continuing to use 
     bool OnCardButton(int i, Point p)
     {
         var card = CardRect(list.GetItemRectangle(i));
-        return CopyRect(card, accounts[i]).Contains(p) || BrowserRect(card).Contains(p) || PlayRect(card).Contains(p) || XRect(card).Contains(p);
+        return CheckRect(card).Contains(p) || CopyRect(card, accounts[i]).Contains(p) || BrowserRect(card).Contains(p) || PlayRect(card).Contains(p) || XRect(card).Contains(p);
     }
     CheckBox afkBox;
     Rectangle CardRect(Rectangle item) { return new Rectangle(item.X + D(18), item.Y + D(6), item.Width - D(36), item.Height - D(12)); }
+    Rectangle CheckRect(Rectangle card) { return new Rectangle(card.X + D(14), card.Y + (card.Height - D(20)) / 2, D(20), D(20)); }
+    int AvatarX(Rectangle card) { return card.X + D(46); }
     Rectangle PlayRect(Rectangle card) { return new Rectangle(card.Right - D(160), card.Y + (card.Height - D(34)) / 2, D(96), D(34)); }
     Rectangle BrowserRect(Rectangle card) { return new Rectangle(card.Right - D(310), card.Y + (card.Height - D(34)) / 2, D(140), D(34)); }
     Rectangle XRect(Rectangle card) { return new Rectangle(card.Right - D(52), card.Y + (card.Height - D(34)) / 2, D(34), D(34)); }
@@ -1059,7 +1250,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
         var card = CardRect(e.Bounds);
         Theme.FillRound(g, Theme.Card, card, D(10));
 
-        var av = new Rectangle(card.X + D(14), card.Y + (card.Height - D(52)) / 2, D(52), D(52));
+        var av = new Rectangle(AvatarX(card), card.Y + (card.Height - D(52)) / 2, D(52), D(52));
         var img = Avatar(a.UserId);
         using (var circle = new GraphicsPath())
         {
@@ -1087,6 +1278,16 @@ These terms may be updated with new versions of the Software. Continuing to use 
         Theme.FillRound(g, Theme.Card2, x, D(8));
         TextRenderer.DrawText(g, "✕", fBtn, x, Theme.Red, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
 
+        // Unticked = left out of Launch all: dim the card, then draw the tick box on top so it stays bright.
+        if (a.Skip) using (var dim = new SolidBrush(Color.FromArgb(120, Theme.Bg))) using (var path = Theme.Round(card, D(10))) g.FillPath(dim, path);
+        var chk = CheckRect(card);
+        if (a.Skip) using (var pen = new Pen(Theme.Muted, D(2))) using (var path = Theme.Round(chk, D(4))) g.DrawPath(pen, path);
+        else
+        {
+            Theme.FillRound(g, Theme.Gold, chk, D(4));
+            TextRenderer.DrawText(g, "✓", fBtn, chk, Theme.Bg, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+
         if (dropAt < 0) return; // drag in progress: outline the card being moved and draw a gold line where it will land
         if (e.Index == dragFrom) using (var pen = new Pen(Theme.Gold, D(2))) using (var path = Theme.Round(card, D(10))) g.DrawPath(pen, path);
         int lineY = dropAt == e.Index ? e.Bounds.Top + D(2) : dropAt == e.Index + 1 && e.Index == accounts.Count - 1 ? e.Bounds.Bottom - D(4) : -1;
@@ -1111,7 +1312,14 @@ These terms may be updated with new versions of the Software. Continuing to use 
         if (justDragged || dropAt >= 0 || i < 0 || i >= accounts.Count) return;
         var card = CardRect(list.GetItemRectangle(i));
         var a = accounts[i];
-        if (CopyRect(card, a).Contains(e.Location)) CopyMenu(a, new Point(CopyRect(card, a).X, CopyRect(card, a).Bottom));
+        if (CheckRect(card).Contains(e.Location))
+        {
+            a.Skip = !a.Skip;
+            Store.Save(accounts);
+            list.Invalidate(list.GetItemRectangle(i));
+            status.Text = Title(a) + (a.Skip ? " is left out of Launch all and Follow/Join. Its Play button still works." : " is included in Launch all and Follow/Join.");
+        }
+        else if (CopyRect(card, a).Contains(e.Location)) CopyMenu(a, new Point(CopyRect(card, a).X, CopyRect(card, a).Bottom));
         else if (XRect(card).Contains(e.Location))
         {
             if (MessageBox.Show(this, "Remove " + Title(a) + "?\nYou'll need to log in again to add it back.", "Multi Alt", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
@@ -1210,11 +1418,65 @@ These terms may be updated with new versions of the Software. Continuing to use 
         catch { }
     }
 
-    void QueueLaunch(List<Account> chosen)
+    // target: null = the Game link box, else a PlaceLauncher request (used by Follow/Join). Pressing Play resets auto-rejoin for that account.
+    void QueueLaunch(List<Account> chosen, string target = null)
     {
         int n = 0;
-        foreach (var a in chosen) if (!IsRunning(a)) { launchQueue.Add(a); n++; }
+        foreach (var a in chosen)
+        {
+            rejoinStopped.Remove(a);
+            rejoins.Remove(a);
+            if (IsRunning(a)) continue;
+            lock (targetFor) targetFor[a] = target;
+            launchQueue.Add(a);
+            n++;
+        }
         status.Text = n == 0 ? "Already running." : "Queued " + n + " account(s) to launch.";
+    }
+
+    void FollowJoin(string who)
+    {
+        who = (who ?? "").Trim().TrimStart('@');
+        var ticked = accounts.Where(a => !a.Skip).ToList();
+        if (who == "") { status.Text = "Type the username or user ID of the player to join."; return; }
+        if (ticked.Count == 0) { status.Text = "No accounts are ticked. Tick the box on the left of a card to include it."; return; }
+        status.Text = "Looking up " + who + "...";
+        new Thread(() =>
+        {
+            try
+            {
+                long id;
+                if (!(who.All(char.IsDigit) && long.TryParse(who, out id))) id = RobloxApi.UserIdFor(who);
+                if (id <= 0) { SetStatus("Couldn't find user " + who + "."); return; }
+                BeginInvoke((Action)(() =>
+                {
+                    QueueLaunch(ticked, "request=RequestFollowUser&userId=" + id);
+                    status.Text = "Joining " + who + ": " + status.Text + " If they aren't in a game or their settings don't allow joins, Roblox will say so.";
+                }));
+            }
+            catch (Exception ex) { SetStatus("Follow/Join: " + ex.Message); }
+        }) { IsBackground = true }.Start();
+    }
+
+    // Clients that went away. Auto-rejoin relaunches ones that closed by themselves, at most 2 times per account in 8 minutes.
+    void ClientsDied(List<Account> died)
+    {
+        foreach (var a in died)
+        {
+            if (userClosed.Remove(a) || !settings.AutoRejoin || !accounts.Contains(a) || rejoinStopped.Contains(a)) continue;
+            List<DateTime> h;
+            if (!rejoins.TryGetValue(a, out h)) rejoins[a] = h = new List<DateTime>();
+            if (Program.AllowRejoin(h, DateTime.UtcNow))
+            {
+                launchQueue.Add(a); // same place it went last time
+                status.Text = "Auto-rejoin: " + Title(a) + " closed, relaunching (" + h.Count + " of 2 in 8 min).";
+            }
+            else
+            {
+                rejoinStopped.Add(a);
+                status.Text = Title(a) + " closed 3 times in 8 min. Auto-rejoin stopped for it (press its Play button to reset).";
+            }
+        }
     }
 
     void StopLaunching() { Account x; while (launchQueue.TryTake(out x)) { } }
@@ -1273,6 +1535,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
         if (MessageBox.Show(this, "Force-close all " + n + " Roblox clients right now?\nAnything not saved in-game is lost.", "Kill all Roblox",
                             MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         StopLaunching();
+        lock (pidAccount) userClosed.UnionWith(pidAccount.Values); // you closed them, so auto-rejoin leaves them closed
         playing = IntPtr.Zero;
         status.Text = "Killing Roblox...";
         ThreadPool.QueueUserWorkItem(_ =>
@@ -1288,12 +1551,22 @@ These terms may be updated with new versions of the Software. Continuing to use 
 
     Rectangle CopyRect(Rectangle card, Account a)
     {
-        int tx = card.X + D(14) + D(52) + D(16);
+        int tx = AvatarX(card) + D(52) + D(16);
         int w = TextRenderer.MeasureText(SubText(a), fSmall).Width;
         return new Rectangle(Math.Min(tx + w + D(6), BrowserRect(card).X - D(30)), card.Y + D(40), D(22), D(22));
     }
 
-    static string SubText(Account a) { return (string.IsNullOrEmpty(a.Username) ? "loading info..." : "@" + a.Username) + (a.UserId > 0 ? "   •   ID " + a.UserId : ""); }
+    string SubText(Account a)
+    {
+        int pid = PidOf(a);
+        return (string.IsNullOrEmpty(a.Username) ? "loading info..." : "@" + a.Username) + (a.UserId > 0 ? "   •   ID " + a.UserId : "") + (pid > 0 ? "   •   PID=" + pid : "");
+    }
+
+    int PidOf(Account a)
+    {
+        lock (pidAccount) foreach (var kv in pidAccount) if (kv.Value == a) return kv.Key;
+        return 0;
+    }
 
     static void DrawCopyIcon(Graphics g, Rectangle r, Color c)
     {
@@ -1388,12 +1661,21 @@ These terms may be updated with new versions of the Software. Continuing to use 
                     SetStatus("RAM cap of " + settings.RamCapGb + " GB reached - stopped launching. Raise it in Performance.");
                     continue;
                 }
-                var place = Program.ParsePlace(settings.PlaceId);
-                if (place == null) { StopLaunching(); SetStatus("Place ID box: paste a game link or its number."); continue; }
+                string target;
+                lock (targetFor) targetFor.TryGetValue(a, out target);
+                var query = target ?? Program.ParseTarget(settings.PlaceId);
+                if (query == null)
+                {
+                    StopLaunching();
+                    SetStatus(Regex.IsMatch(settings.PlaceId, "share\\?code=", RegexOptions.IgnoreCase)
+                        ? "roblox.com/share links aren't supported: open it in a browser and paste the address it turns into (with privateServerLinkCode)."
+                        : "Game link box: paste a game link, its place ID, or a private server link.");
+                    continue;
+                }
 
                 SetStatus("Launching " + Title(a) + "  (" + launchQueue.Count + " more queued)...");
                 var before = RobloxPids();
-                Process.Start(RobloxApi.BuildUri(RobloxApi.GetTicket(a.Cookie), place));
+                Process.Start(RobloxApi.BuildUri(RobloxApi.GetTicket(a.Cookie), query));
                 // Roblox first runs a short-lived launcher process, so wait (up to 60s) for a new one that has a game window.
                 for (int t = 0; t < 120; t++)
                 {
@@ -1512,7 +1794,23 @@ These terms may be updated with new versions of the Software. Continuing to use 
         add(note("Roblox can fail or rate-limit if many clients start in the same second. 5 is safe; go higher if launches fail."), D(28));
         var delay = new NumericUpDown { Minimum = 0, Maximum = 120, Value = Math.Min(120, Math.Max(0, settings.LaunchDelaySec)), Width = D(90), BackColor = Theme.Card, ForeColor = Theme.Fg };
         delay.ValueChanged += (s, e) => { settings.LaunchDelaySec = (int)delay.Value; Store.SaveSettings(settings); };
-        add(delay, D(50));
+        add(delay, D(44));
+        Func<string, bool, Action<bool>, CheckBox> check = (text, on, changed) =>
+        {
+            var c = new CheckBox { Text = text, Checked = on, ForeColor = Theme.Fg, AutoSize = true, MaximumSize = new Size(D(760), 0), Font = new Font("Segoe UI", 10.5f) };
+            c.CheckedChanged += (s, e) => changed(c.Checked);
+            return c;
+        };
+        add(check("Auto-rejoin (off by default): relaunch a client that closes by itself. Max 2 times per account in 8 minutes, then it stops for that account. Never relaunches clients you closed.",
+                  settings.AutoRejoin, v => { settings.AutoRejoin = v; Store.SaveSettings(settings); }), D(56));
+
+        add(Theme.Lbl("AUDIO", 9, Theme.Gold, true), D(28));
+        add(check("Mute Roblox: hard-mute every Roblox client in the Windows volume mixer (unmutes when you untick this or close Multi Alt).",
+                  settings.MuteRoblox, v =>
+                  {
+                      settings.MuteRoblox = v; Store.SaveSettings(settings);
+                      ThreadPool.QueueUserWorkItem(_ => { try { RobloxAudio.SetMute(RobloxPids(), v); } catch { } });
+                  }), D(56));
 
         add(Theme.Lbl("CLIENTS", 9, Theme.Gold, true), D(28));
         var row = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Theme.Bg };
@@ -1521,11 +1819,73 @@ These terms may be updated with new versions of the Software. Continuing to use 
         add(row, D(60));
 
         add(Theme.Lbl("ABOUT", 9, Theme.Gold, true), D(28));
-        add(Theme.Lbl("Multi Alt v1.0  —  by Triple DDD", 12, Theme.Fg, true), D(32));
+        add(Theme.Lbl("Multi Alt v" + Program.Version + "  —  by Triple DDD", 12, Theme.Fg, true), D(32));
         add(note("Keep Multi Alt open while you play: it's what lets more than one Roblox run at once.\r\n"
                + "Accounts are encrypted with Windows (DPAPI) so only your Windows user on this PC can read them, and logins are only ever sent to roblox.com.\r\n"
                + "Data folder: " + Store.Dir), D(80));
+        add(check("Check GitHub for updates on startup (only asks for the latest version number; never downloads anything)",
+                  settings.CheckUpdates, v => { settings.CheckUpdates = v; Store.SaveSettings(settings); }), D(50));
+
+        add(Theme.Lbl("REMOVE MULTI ALT", 9, Theme.Gold, true), D(28));
+        add(note("Closes all Roblox clients, then deletes Multi Alt.exe. Burning also wipes every saved account, setting and log."), D(28));
+        var del = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Theme.Bg };
+        del.Controls.Add(Theme.Btn("Delete Multi Alt (keep my data)", Theme.Card, (s, e) => Uninstall(false)));
+        del.Controls.Add(Theme.Btn("Delete Multi Alt + burn all data", Color.FromArgb(120, 24, 32), (s, e) => Uninstall(true)));
+        add(del, D(70));
         return p;
+    }
+
+    void Uninstall(bool burn)
+    {
+        var exe = Application.ExecutablePath;
+        if (!burn)
+        {
+            if (MessageBox.Show("Close all Roblox clients and delete Multi Alt?\n\nYour saved accounts stay in " + Store.Dir + " so a fresh download picks them up.",
+                                "Delete Multi Alt", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        }
+        else if (!ConfirmBurn()) return;
+
+        StopLaunching();
+        if (settings.MuteRoblox) try { RobloxAudio.SetMute(RobloxPids(), false); } catch { }
+        foreach (var name in new[] { "RobloxPlayerLauncher", "RobloxPlayerBeta" })
+            foreach (var pr in Process.GetProcessesByName(name))
+                try { pr.Kill(); pr.WaitForExit(3000); } catch { } finally { pr.Dispose(); }
+
+        var left = new List<string>();
+        if (burn)
+        {
+            left = Store.Burn();
+            try { Clipboard.Clear(); } catch { }
+        }
+        // the exe can't delete itself while running: a hidden cmd waits ~2s for us to exit, then deletes it
+        Process.Start(new ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 > nul & del /f /q \"" + exe + "\"") { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden });
+        MessageBox.Show((burn ? "All Multi Alt data was burned." : "Multi Alt will be deleted. Your data is kept in " + Store.Dir + ".")
+                        + (left.Count > 0 ? "\n\nCouldn't fully remove (delete by hand):\n" + string.Join("\n", left) : "")
+                        + (burn ? "\n\nTip: on roblox.com go to Settings > Security > \"Log out of all other sessions\" on each account so old logins stop working everywhere." : "")
+                        + "\n\nGoodbye!", "Multi Alt");
+        Environment.Exit(0);
+    }
+
+    bool ConfirmBurn()
+    {
+        using (var f = new Form { Text = "Burn all data", BackColor = Theme.Bg, ForeColor = Theme.Fg, Icon = Icon, StartPosition = FormStartPosition.CenterParent,
+                                  FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false, ClientSize = new Size(D(520), D(300)) })
+        {
+            var msg = new Label { Text = "This permanently deletes Multi Alt AND everything it saved:\r\n"
+                                       + "  • every saved account login and password (accounts.dat is overwritten, then deleted)\r\n"
+                                       + "  • settings, crash logs, and the old MultiRoblox folder\r\n"
+                                       + "  • whatever is on your clipboard\r\n\r\n"
+                                       + "It can't be undone. Type BURN to confirm.",
+                                  Location = new Point(D(16), D(14)), Size = new Size(D(488), D(150)), Font = new Font("Segoe UI", 10f) };
+            var box = new TextBox { Location = new Point(D(16), D(170)), Width = D(200), BackColor = Theme.Card, ForeColor = Theme.Fg, Font = new Font("Segoe UI", 12f) };
+            var go = Theme.Btn("Burn it", Color.FromArgb(120, 24, 32), (s, e) => f.DialogResult = DialogResult.OK);
+            go.Location = new Point(D(16), D(220)); go.Enabled = false;
+            var cancel = Theme.Btn("Cancel", Theme.Card, (s, e) => f.DialogResult = DialogResult.Cancel);
+            cancel.Location = new Point(D(200), D(220));
+            box.TextChanged += (s, e) => go.Enabled = box.Text.Trim() == "BURN";
+            f.Controls.AddRange(new Control[] { msg, box, go, cancel });
+            return f.ShowDialog(this) == DialogResult.OK && box.Text.Trim() == "BURN";
+        }
     }
 
     void TileWindows()
@@ -1553,13 +1913,35 @@ static class Program
         return s == null ? null : Image.FromStream(s);
     }
 
-    // "" -> "" (Roblox home), "123" -> "123", "https://www.roblox.com/games/123/Name" -> "123", anything else -> null.
-    public static string ParsePlace(string input)
+    public const string Version = "1.1.0";
+
+    // Game link box -> PlaceLauncher query. "" -> "" (Roblox home), place ID or game link -> RequestGame,
+    // link with privateServerLinkCode -> RequestPrivateGame, anything else -> null.
+    public static string ParseTarget(string input)
     {
         var s = (input ?? "").Trim();
-        if (s.All(char.IsDigit)) return s;
+        if (s == "") return "";
+        if (s.All(char.IsDigit)) return "request=RequestGame&placeId=" + s;
         var m = Regex.Match(s, @"(?:/games/|placeId=)(\d+)", RegexOptions.IgnoreCase);
-        return m.Success ? m.Groups[1].Value : null;
+        if (!m.Success) return null;
+        var code = Regex.Match(s, @"privateServerLinkCode=([\w-]+)", RegexOptions.IgnoreCase);
+        return code.Success ? "request=RequestPrivateGame&placeId=" + m.Groups[1].Value + "&linkCode=" + code.Groups[1].Value
+                            : "request=RequestGame&placeId=" + m.Groups[1].Value;
+    }
+
+    // Auto-rejoin limit: at most 2 rejoins in any 8 minutes. h = this account's rejoin times.
+    public static bool AllowRejoin(List<DateTime> h, DateTime now)
+    {
+        h.RemoveAll(t => now - t > TimeSpan.FromMinutes(8));
+        if (h.Count >= 2) return false;
+        h.Add(now);
+        return true;
+    }
+
+    public static bool IsNewer(string tag, string current)
+    {
+        try { return new Version((tag ?? "").Trim().TrimStart('v', 'V')) > new Version(current); }
+        catch { return false; }
     }
 
     static readonly string CrashLog = Path.Combine(Store.Dir, "crash.log");
@@ -1637,14 +2019,30 @@ static class Program
         var t = Tiler.Tile(5, new[] { new Rectangle(0, 0, 1920, 1080), new Rectangle(1920, 0, 1280, 1024) });
         Check(t[0] == new Rectangle(0, 0, 960, 540) && t[1] == new Rectangle(1920, 0, 640, 1024), "tile layout");
 
-        var uri = RobloxApi.BuildUri("TICKET", "1818");
+        var uri = RobloxApi.BuildUri("TICKET", "request=RequestGame&placeId=1818");
         Check(uri.StartsWith("roblox-player:1+gameinfo:TICKET+") && uri.Contains("placeId%3D1818") && uri.Contains("launchmode:play"), "uri");
+        Check(RobloxApi.BuildUri("TICKET", "").Contains("launchmode:app"), "uri home");
 
         Check(BrowserLogin.ExtractCookie("{\"id\":3,\"result\":{\"cookies\":[{\"name\":\"RBXSource\",\"value\":\"x\"},{\"name\":\".ROBLOSECURITY\",\"value\":\"_|WARNING:-DO-NOT-SHARE|_ABC\",\"domain\":\".roblox.com\"}]}}")
               == "_|WARNING:-DO-NOT-SHARE|_ABC" && BrowserLogin.ExtractCookie("{\"id\":1,\"result\":{\"cookies\":[]}}") == null, "cookie extract");
 
-        Check(ParsePlace("") == "" && ParsePlace(" 920587237 ") == "920587237" && ParsePlace("https://www.roblox.com/games/920587237/Adopt-Me") == "920587237"
-              && ParsePlace("roblox.com/games/start?placeId=55&launchData=x") == "55" && ParsePlace("adopt me") == null, "place parse");
+        const string G = "request=RequestGame&placeId=";
+        Check(ParseTarget("") == "" && ParseTarget(" 920587237 ") == G + "920587237" && ParseTarget("https://www.roblox.com/games/920587237/Adopt-Me") == G + "920587237"
+              && ParseTarget("roblox.com/games/start?placeId=55&launchData=x") == G + "55" && ParseTarget("adopt me") == null
+              && ParseTarget("https://www.roblox.com/games/920587237/Adopt-Me?privateServerLinkCode=1234-abcd_56")
+                 == "request=RequestPrivateGame&placeId=920587237&linkCode=1234-abcd_56"
+              && ParseTarget("https://www.roblox.com/share?code=abc&type=Server") == null, "target parse");
+
+        var h = new List<DateTime>(); var t0 = new DateTime(2026, 1, 1);
+        Check(AllowRejoin(h, t0) && AllowRejoin(h, t0.AddMinutes(1)) && !AllowRejoin(h, t0.AddMinutes(2))
+              && !AllowRejoin(h, t0.AddMinutes(7)) && AllowRejoin(h, t0.AddMinutes(8.5)), "rejoin limit");
+
+        Check(IsNewer("v1.2.0", "1.1.0") && !IsNewer("v1.1.0", "1.1.0") && !IsNewer("1.0.0", "1.1.0") && !IsNewer("garbage", "1.1.0") && !IsNewer(null, "1.1.0"), "version compare");
+
+        var tmp = Path.GetTempFileName();
+        File.WriteAllText(tmp, "secret");
+        Store.Shred(tmp);
+        Check(!File.Exists(tmp), "shred");
 
         var l1 = new List<char>("abcd"); var l2 = new List<char>("abcd"); var l3 = new List<char>("abcd");
         Check(MoveItem(l1, 0, 3) == 2 && new string(l1.ToArray()) == "bcad" && MoveItem(l2, 3, 0) == 0 && new string(l2.ToArray()) == "dabc"
