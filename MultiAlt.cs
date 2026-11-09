@@ -1126,7 +1126,8 @@ These terms may be updated with new versions of the Software. Continuing to use 
     Panel BuildAccounts()
     {
         var p = new Panel { BackColor = Theme.Bg };
-        var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = D(100), Padding = new Padding(D(18), D(6), 0, 0), BackColor = Theme.Bg };
+        // AutoSize: grows to however many rows the controls wrap into, so a narrow window can't push Follow/Join under the list
+        var bar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(D(18), D(6), 0, D(6)), BackColor = Theme.Bg };
         bar.Controls.Add(Theme.Btn("+  Add account", Theme.Gold, AddAccountDialog));
         bar.Controls.Add(Theme.Btn("Login via Roblox", Theme.Blue, (s, e) => LoginViaRoblox()));
         bar.Controls.Add(Theme.Btn("▶  Launch all", Theme.Card, (s, e) =>
@@ -1135,8 +1136,10 @@ These terms may be updated with new versions of the Software. Continuing to use 
             if (ticked.Count == 0) status.Text = "No accounts are ticked. Tick the box on the left of a card to include it in Launch all.";
             else QueueLaunch(ticked);
         }));
-        bar.Controls.Add(Theme.Btn("■  Stop launching", Theme.Card, (s, e) => { StopLaunching(); status.Text = "Launch queue cleared."; }));
-        var lp = Theme.Lbl("Game link / Place ID", 10, Theme.Muted); lp.Margin = new Padding(D(12), D(8), D(6), 0);
+        var stop = Theme.Btn("■  Stop launching", Theme.Card, (s, e) => { StopLaunching(); status.Text = "Launch queue cleared."; });
+        bar.Controls.Add(stop);
+        bar.SetFlowBreak(stop, true); // rows: buttons / game link / follow-join, so a label never ends up on a different row than its box
+        var lp = Theme.Lbl("Game link / Place ID", 10, Theme.Muted); lp.Margin = new Padding(0, D(8), D(6), 0);
         var placeBox = new TextBox { Width = D(320), Text = settings.PlaceId, BackColor = Theme.Card, ForeColor = Theme.Fg, BorderStyle = BorderStyle.FixedSingle, Margin = new Padding(0, D(5), 0, 0) };
         placeBox.TextChanged += (s, e) => { settings.PlaceId = placeBox.Text.Trim(); Store.SaveSettings(settings); };
         bar.Controls.Add(lp);
