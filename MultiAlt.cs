@@ -59,6 +59,26 @@ static class Store
     static readonly string SettingsFile = Path.Combine(Dir, "settings.json");
     public static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
+    // Which running client belongs to which account (pid, start time, user ID; no logins), so restarting
+    // Multi Alt doesn't forget who's who. The start time stops a reused PID from matching a different program.
+    public static readonly string RunningFile = Path.Combine(Dir, "running.txt");
+    public static string RunningLine(int pid, long userId)
+    {
+        using (var p = Process.GetProcessById(pid)) return pid + "\t" + p.StartTime.ToFileTimeUtc() + "\t" + userId;
+    }
+    public static Dictionary<int, long> ParseRunning(IEnumerable<string> lines) // pid -> userId, only for processes still alive
+    {
+        var d = new Dictionary<int, long>();
+        foreach (var l in lines)
+        {
+            var f = l.Split('\t');
+            int pid; long start, uid;
+            if (f.Length != 3 || !int.TryParse(f[0], out pid) || !long.TryParse(f[1], out start) || !long.TryParse(f[2], out uid)) continue;
+            try { using (var p = Process.GetProcessById(pid)) if (p.StartTime.ToFileTimeUtc() == start) d[pid] = uid; } catch { } // gone
+        }
+        return d;
+    }
+
     // Cookies are encrypted with Windows DPAPI: only this Windows user on this PC can decrypt them.
     public static byte[] Encode(List<Account> accounts)
     {
@@ -867,12 +887,37 @@ These terms may be updated with new versions of the Software. Continuing to use 
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        LoadRunning();
         new Thread(LaunchWorker) { IsBackground = true }.Start();
         new Thread(RefreshAccountInfo) { IsBackground = true }.Start();
         new Thread(AntiAfkLoop) { IsBackground = true, Priority = ThreadPriority.BelowNormal }.Start();
         if (settings.CheckUpdates) new Thread(CheckForUpdate) { IsBackground = true }.Start();
         if (settings.FpsCap > 0) new Thread(() => FpsTweak.Apply(settings.FpsCap)) { IsBackground = true }.Start(); // Roblox updates make new version folders
         poller = new System.Threading.Timer(_ => Poll(), null, 300, 2000);
+    }
+
+    void SaveRunning()
+    {
+        lock (pidAccount) // also keeps the launch and poll threads from writing the file at the same time
+        {
+            var lines = new List<string>();
+            foreach (var kv in pidAccount) try { if (kv.Value.UserId > 0) lines.Add(Store.RunningLine(kv.Key, kv.Value.UserId)); } catch { }
+            try { Directory.CreateDirectory(Store.Dir); File.WriteAllLines(Store.RunningFile, lines); } catch { }
+        }
+    }
+
+    void LoadRunning()
+    {
+        try
+        {
+            if (!File.Exists(Store.RunningFile)) return;
+            foreach (var kv in Store.ParseRunning(File.ReadAllLines(Store.RunningFile)))
+            {
+                var a = accounts.FirstOrDefault(x => x.UserId == kv.Value);
+                if (a != null) lock (pidAccount) pidAccount[kv.Key] = a;
+            }
+        }
+        catch { }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -1086,6 +1131,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
             var died = new List<Account>();
             lock (pidAccount)
                 foreach (var dead in pidAccount.Keys.Where(k => !pids.Contains(k)).ToList()) { died.Add(pidAccount[dead]); pidAccount.Remove(dead); }
+            if (died.Count > 0) SaveRunning();
             if (died.Count > 0 && IsHandleCreated && !IsDisposed) BeginInvoke((Action)(() => ClientsDied(died)));
 
             // New Roblox windows: take them off the taskbar and park them off-screen; they live in Home.
@@ -1686,7 +1732,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
                     HashSet<int> skip;
                     lock (pidAccount) skip = new HashSet<int>(before.Concat(pidAccount.Keys));
                     int fresh = NewWindowPid(skip);
-                    if (fresh != 0) { lock (pidAccount) pidAccount[fresh] = a; break; }
+                    if (fresh != 0) { lock (pidAccount) pidAccount[fresh] = a; SaveRunning(); break; }
                 }
                 Thread.Sleep(Math.Max(0, settings.LaunchDelaySec) * 1000);
                 if (launchQueue.Count == 0) SetStatus("All launches done.");
@@ -2051,6 +2097,10 @@ static class Program
         File.WriteAllText(tmp, "secret");
         Store.Shred(tmp);
         Check(!File.Exists(tmp), "shred");
+
+        int me = Process.GetCurrentProcess().Id;
+        var running = Store.ParseRunning(new[] { Store.RunningLine(me, 42), me + "\t123\t7", "junk", "999999999\t1\t5" });
+        Check(running.Count == 1 && running[me] == 42, "running restore"); // right start time kept; wrong start time, junk and dead pid dropped
 
         var l1 = new List<char>("abcd"); var l2 = new List<char>("abcd"); var l3 = new List<char>("abcd");
         Check(MoveItem(l1, 0, 3) == 2 && new string(l1.ToArray()) == "bcad" && MoveItem(l2, 3, 0) == 0 && new string(l2.ToArray()) == "dabc"
