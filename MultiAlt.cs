@@ -1797,7 +1797,8 @@ These terms may be updated with new versions of the Software. Continuing to use 
         add(delay, D(44));
         Func<string, bool, Action<bool>, CheckBox> check = (text, on, changed) =>
         {
-            var c = new CheckBox { Text = text, Checked = on, ForeColor = Theme.Fg, AutoSize = true, MaximumSize = new Size(D(760), 0), Font = new Font("Segoe UI", 10.5f) };
+            // fixed size (not AutoSize) so long text wraps onto a second line instead of running off the page
+            var c = new CheckBox { Text = text, Checked = on, ForeColor = Theme.Fg, AutoSize = false, Size = new Size(D(780), D(44)), Font = new Font("Segoe UI", 10f) };
             c.CheckedChanged += (s, e) => changed(c.Checked);
             return c;
         };
@@ -1845,7 +1846,10 @@ These terms may be updated with new versions of the Software. Continuing to use 
         }
         else if (!ConfirmBurn()) return;
 
+        // stop everything that could relaunch Roblox or rewrite data while we tear down
+        if (poller != null) poller.Dispose();
         StopLaunching();
+        userClosed.UnionWith(accounts);
         if (settings.MuteRoblox) try { RobloxAudio.SetMute(RobloxPids(), false); } catch { }
         foreach (var name in new[] { "RobloxPlayerLauncher", "RobloxPlayerBeta" })
             foreach (var pr in Process.GetProcessesByName(name))
@@ -1857,12 +1861,13 @@ These terms may be updated with new versions of the Software. Continuing to use 
             left = Store.Burn();
             try { Clipboard.Clear(); } catch { }
         }
-        // the exe can't delete itself while running: a hidden cmd waits ~2s for us to exit, then deletes it
-        Process.Start(new ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 > nul & del /f /q \"" + exe + "\"") { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden });
         MessageBox.Show((burn ? "All Multi Alt data was burned." : "Multi Alt will be deleted. Your data is kept in " + Store.Dir + ".")
                         + (left.Count > 0 ? "\n\nCouldn't fully remove (delete by hand):\n" + string.Join("\n", left) : "")
                         + (burn ? "\n\nTip: on roblox.com go to Settings > Security > \"Log out of all other sessions\" on each account so old logins stop working everywhere." : "")
                         + "\n\nGoodbye!", "Multi Alt");
+        // the exe can't delete itself while running: a hidden cmd waits ~2s for us to exit, then deletes it.
+        // Started after the message box so a slow click on OK can't make it run while the exe is still open.
+        Process.Start(new ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 > nul & del /f /q \"" + exe + "\"") { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden });
         Environment.Exit(0);
     }
 
