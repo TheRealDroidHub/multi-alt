@@ -44,6 +44,13 @@ public class AppSettings
     public bool AutoRejoin { get; set; }       // off by default
     public bool MuteRoblox { get; set; }
     public bool CheckUpdates { get; set; }
+    public bool KeepRobloxUpdated { get; set; }        // off by default
+    public bool RemoveOldRobloxVersions { get; set; }  // off by default, needs KeepRobloxUpdated
+    public string LastRobloxUpdateVersion { get; set; } // the Roblox version Multi Alt last ran the installer for (never twice)
+    public bool CloseToTray { get; set; }
+    public bool StartMenuShortcut { get; set; }        // off by default
+    public bool CleanCrashHandlers { get; set; }       // off by default
+    public string AcceptedTerms { get; set; }          // fingerprint of the Terms text the user pressed "I agree" on
     public AppSettings() { LowPriorityBackground = true; LaunchDelaySec = 5; PlaceId = ""; CheckUpdates = true; }
 }
 
@@ -110,9 +117,12 @@ static class Store
 
     public static void SaveSettings(AppSettings s) { WriteSafely(SettingsFile, Encoding.UTF8.GetBytes(Json.Serialize(s))); }
 
+    public static bool Frozen; // set once Burn starts: a save still queued can't write the burned data back
+
     // Write to a temp file then swap, so a crash mid-save never wipes hundreds of saved accounts.
     static void WriteSafely(string path, byte[] data)
     {
+        if (Frozen) return;
         Directory.CreateDirectory(Path.GetDirectoryName(path));
         var tmp = path + ".tmp";
         File.WriteAllBytes(tmp, data);
@@ -209,8 +219,9 @@ static class RobloxApi
             {
                 var item = (Dictionary<string, object>)o;
                 var url = item["imageUrl"] as string;
-                if (string.IsNullOrEmpty(url)) continue;
-                using (var wc = new WebClient()) wc.DownloadFile(url, Path.Combine(Store.AvatarDir, Convert.ToInt64(item["targetId"]) + ".png"));
+                Uri u;
+                if (!Uri.TryCreate(url, UriKind.Absolute, out u) || u.Scheme != "https" || !u.Host.EndsWith(".rbxcdn.com", StringComparison.OrdinalIgnoreCase)) continue; // Roblox's image CDN only
+                using (var wc = new WebClient()) File.WriteAllBytes(Path.Combine(Store.AvatarDir, Convert.ToInt64(item["targetId"]) + ".png"), wc.DownloadData(url)); // a failed download keeps the old picture
             }
         }
     }
@@ -300,8 +311,8 @@ static class BrowserLogin
         probe.Start();
         int port = ((IPEndPoint)probe.LocalEndpoint).Port;
         probe.Stop();
-        var browser = Process.Start(exe, "--user-data-dir=\"" + profile + "\" --remote-debugging-port=" + port
-            + " --no-first-run --no-default-browser-check --new-window " + url);
+        var browser = Program.StartNormal(new ProcessStartInfo(exe, "--user-data-dir=\"" + profile + "\" --remote-debugging-port=" + port
+            + " --no-first-run --no-default-browser-check --new-window " + url));
         wsUrl = null;
         for (int i = 0; i < 60 && wsUrl == null; i++)
         {
@@ -320,7 +331,7 @@ static class BrowserLogin
     // Opens roblox.com logged in as this account, in a browser profile kept just for that account.
     public static void OpenAs(Account a)
     {
-        var profile = Path.Combine(Store.Dir, "browser", a.UserId > 0 ? a.UserId.ToString() : a.Name);
+        var profile = Path.Combine(Store.Dir, "browser", a.UserId > 0 ? a.UserId.ToString() : "name_" + Regex.Replace(a.Name ?? "", "[^A-Za-z0-9_]", "_")); // a nickname can't point outside
         string wsUrl;
         Start(profile, "about:blank", out wsUrl);
         using (var ws = new ClientWebSocket())
@@ -408,23 +419,266 @@ static class BrowserLogin
 // Roblox reads FFlags from ClientSettings\ClientAppSettings.json next to each installed client version.
 static class FpsTweak
 {
+    static readonly object gate = new object(); // launches, the Performance page and a Roblox update can all apply it at once
+
     public static int Apply(int fps)
     {
-        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Roblox", "Versions");
-        if (!Directory.Exists(root)) return 0;
-        int n = 0;
-        foreach (var dir in Directory.GetDirectories(root).Where(d => File.Exists(Path.Combine(d, "RobloxPlayerBeta.exe"))))
+        lock (gate)
         {
+            string[] dirs;
+            try { dirs = Directory.GetDirectories(RobloxInstall.Root); } catch { return 0; } // Roblox isn't installed
+            int n = 0;
+            foreach (var dir in dirs)
+            {
+                try
+                {
+                    if (!File.Exists(Path.Combine(dir, "RobloxPlayerBeta.exe"))) continue;
+                    var f = Path.Combine(dir, "ClientSettings", "ClientAppSettings.json");
+                    var d = (File.Exists(f) ? Store.Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(f)) : null) ?? new Dictionary<string, object>();
+                    object cur;
+                    bool has = d.TryGetValue("DFIntTaskSchedulerTargetFps", out cur);
+                    if (fps > 0 ? !(has && Convert.ToString(cur) == fps.ToString()) : has) // only write when it changes
+                    {
+                        if (fps > 0) d["DFIntTaskSchedulerTargetFps"] = fps; else d.Remove("DFIntTaskSchedulerTargetFps");
+                        Directory.CreateDirectory(Path.GetDirectoryName(f));
+                        File.WriteAllText(f, Store.Json.Serialize(d));
+                    }
+                    n++;
+                }
+                catch { } // a broken user-edited file is left alone
+            }
+            return n;
+        }
+    }
+}
+
+// The normal Roblox player install in %LOCALAPPDATA%\Roblox\Versions: used to start the live client directly, and by the
+// opt-in "Keep Roblox updated" and "Remove old Roblox versions". Reads the registry but never writes it, and never touches
+// Program Files, Studio, the Microsoft Store version or other launchers (Bloxstrap, Fishstrap...).
+static class RobloxInstall
+{
+    public static readonly string Root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Roblox", "Versions");
+    static readonly object gate = new object();
+    static string live;
+    static DateTime liveAt = DateTime.MinValue;
+
+    public static bool IsVersionName(string s) { return s != null && Regex.IsMatch(s, @"^version-[0-9a-f]{16}\z"); }
+
+    public static string ParseLive(string json)
+    {
+        try
+        {
+            var d = Store.Json.Deserialize<Dictionary<string, object>>(json);
+            object v;
+            if (d != null && d.TryGetValue("clientVersionUpload", out v) && IsVersionName(v as string)) return (string)v;
+        }
+        catch { }
+        return null;
+    }
+
+    // The Roblox version being served now (a client that differs updates itself first). Public endpoint, no login sent.
+    // fresh: ask now, null if Roblox can't be reached. Otherwise asks at most every 5 minutes and keeps the last answer.
+    public static string LiveVersion(bool fresh)
+    {
+        lock (gate)
+        {
+            var now = DateTime.UtcNow;
+            if (fresh || Program.Due(liveAt, now, 300))
+            {
+                liveAt = now;
+                string v = null;
+                try { v = ParseLive(RobloxApi.Http("https://clientsettingscdn.roblox.com/v2/client-version/WindowsPlayer", null)); } catch { }
+                if (v != null) live = v;
+                else if (fresh) return null;
+            }
+            return live;
+        }
+    }
+
+    // The program in a registry "open" command: "C:\path\app.exe" %1 -> C:\path\app.exe
+    public static string CommandExe(string command)
+    {
+        var m = Regex.Match(command ?? "", "^\\s*(?:\"([^\"]+)\"|(\\S+))");
+        return !m.Success ? null : m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
+    }
+
+    // What this Windows user's roblox-player: (or roblox:) links run - what the website's Play button starts.
+    public static string HandlerExe(string protocol) { return RegExe(@"Software\Classes\" + protocol + @"\shell\open\command", null); }
+
+    // What Windows' "uninstall Roblox" entry runs (its folder is kept, so uninstalling Roblox keeps working).
+    public static string UninstallerExe() { return RegExe(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\roblox-player", "UninstallString"); }
+
+    static string RegExe(string key, string value)
+    {
+        try { using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(key)) return k == null ? null : CommandExe(k.GetValue(value) as string); }
+        catch { return null; }
+    }
+
+    // "version-..." when exe sits directly in a version folder under root, else null (another launcher, Program Files...).
+    public static string VersionOf(string exe) { return VersionOf(exe, Root); }
+    public static string VersionOf(string exe, string root)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(Path.GetFullPath(exe));
+            var name = Path.GetFileName(dir);
+            if (IsVersionName(name) && string.Equals(Path.GetDirectoryName(dir), Path.GetFullPath(root).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) return name;
+        }
+        catch { } // no path
+        return null;
+    }
+
+    public static string ClientExe(string version)
+    {
+        if (!IsVersionName(version)) return null;
+        var exe = Path.Combine(Root, version, "RobloxPlayerBeta.exe");
+        return File.Exists(exe) ? exe : null;
+    }
+
+    public static bool IsOpen(string name)
+    {
+        var ps = Process.GetProcessesByName(name);
+        foreach (var p in ps) p.Dispose();
+        return ps.Length > 0;
+    }
+
+    // The first Roblox player program that's open (client, launcher, installer or crash handler), else null.
+    public static string Running()
+    {
+        foreach (var n in new[] { "RobloxPlayerBeta", "RobloxPlayerLauncher", "RobloxPlayerInstaller", "RobloxCrashHandler" })
+            if (IsOpen(n)) return n;
+        return null;
+    }
+
+    // A launch link goes to the client as one command-line argument: refuse anything that could split or escape it.
+    public static bool SafeArg(string s) { return !string.IsNullOrEmpty(s) && s.All(c => c > ' ' && c < 127 && c != '"'); }
+
+    // Waits until no Roblox installer runs, two checks in a row (it restarts itself from a temp folder). Adds the
+    // installers it sees to seen. False if one still runs after max.
+    public static bool WaitForInstaller(TimeSpan max, ICollection<int> seen)
+    {
+        var end = DateTime.UtcNow + max;
+        for (int clear = 0; ; Thread.Sleep(1000))
+        {
+            var ps = Process.GetProcessesByName("RobloxPlayerInstaller");
+            foreach (var p in ps) { if (seen != null) seen.Add(p.Id); p.Dispose(); }
+            clear = ps.Length == 0 ? clear + 1 : 0;
+            if (clear >= 2) return true;
+            if (DateTime.UtcNow >= end) return false;
+        }
+    }
+
+    // Roblox's own installer (it ships in every version folder): the one next to the client roblox-player: links use, else the newest.
+    public static string Installer()
+    {
+        try
+        {
+            var v = VersionOf(HandlerExe("roblox-player"));
+            var f = v == null ? null : Path.Combine(Root, v, "RobloxPlayerInstaller.exe");
+            if (f != null && File.Exists(f)) return f;
+            return Directory.GetDirectories(Root).Where(d => IsVersionName(Path.GetFileName(d)))
+                .Select(d => Path.Combine(d, "RobloxPlayerInstaller.exe")).Where(x => File.Exists(x))
+                .OrderByDescending(x => File.GetLastWriteTimeUtc(x)).FirstOrDefault();
+        }
+        catch { return null; }
+    }
+
+    public class VersionDir { public string Name; public bool Player, Studio, Link; }
+
+    public static List<VersionDir> Scan()
+    {
+        var list = new List<VersionDir>();
+        foreach (var d in Directory.GetDirectories(Root))
+        {
+            var v = new VersionDir { Name = Path.GetFileName(d) };
             try
             {
-                var f = Path.Combine(dir, "ClientSettings", "ClientAppSettings.json");
-                Directory.CreateDirectory(Path.GetDirectoryName(f));
-                var d = (File.Exists(f) ? Store.Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(f)) : null) ?? new Dictionary<string, object>();
-                if (fps > 0) d["DFIntTaskSchedulerTargetFps"] = fps; else d.Remove("DFIntTaskSchedulerTargetFps");
-                File.WriteAllText(f, Store.Json.Serialize(d));
-                n++;
+                v.Link = (File.GetAttributes(d) & FileAttributes.ReparsePoint) != 0;
+                if (!v.Link)
+                {
+                    v.Player = File.Exists(Path.Combine(d, "RobloxPlayerBeta.exe"));
+                    v.Studio = Directory.GetFiles(d, "RobloxStudio*").Length > 0;
+                }
             }
-            catch { } // a broken user-edited file is left alone
+            catch { v.Link = true; } // can't read it: never touch it
+            list.Add(v);
+        }
+        return list;
+    }
+
+    // Old Roblox player folders that are safe to delete: a real "version-" folder holding the player and no Studio, not a
+    // link, and not one of keep (the live version and whatever Roblox links point at).
+    public static List<string> PickOld(IEnumerable<VersionDir> dirs, IEnumerable<string> keep)
+    {
+        var k = new HashSet<string>(keep.Where(x => x != null), StringComparer.OrdinalIgnoreCase);
+        return dirs.Where(d => IsVersionName(d.Name) && d.Player && !d.Studio && !d.Link && !k.Contains(d.Name)).Select(d => d.Name).ToList();
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct ProcEntry // PROCESSENTRY32W
+    {
+        public uint Size, Usage, Pid;
+        public IntPtr Heap;
+        public uint Module, Threads, Parent;
+        public int Base;
+        public uint Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Exe;
+    }
+    [DllImport("kernel32.dll")] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)] static extern bool Process32FirstW(IntPtr snap, ref ProcEntry e);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)] static extern bool Process32NextW(IntPtr snap, ref ProcEntry e);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+    // pid -> (parent pid, exe name) for every process, from the Windows process snapshot.
+    public static Dictionary<int, Tuple<int, string>> Processes()
+    {
+        var d = new Dictionary<int, Tuple<int, string>>();
+        var h = CreateToolhelp32Snapshot(2, 0); // TH32CS_SNAPPROCESS
+        if (h == IntPtr.Zero || h == new IntPtr(-1)) return d;
+        try
+        {
+            var e = new ProcEntry { Size = (uint)Marshal.SizeOf(typeof(ProcEntry)) };
+            for (bool ok = Process32FirstW(h, ref e); ok; ok = Process32NextW(h, ref e))
+                d[(int)e.Pid] = Tuple.Create((int)e.Parent, e.Exe);
+        }
+        finally { CloseHandle(h); }
+        return d;
+    }
+
+    // Closes Roblox clients one of these installers opened on its own after updating, if they started after since.
+    public static void CloseOpenedBy(ICollection<int> installers, DateTime since)
+    {
+        foreach (var kv in Processes())
+        {
+            if (!installers.Contains(kv.Value.Item1) || !string.Equals(kv.Value.Item2, "RobloxPlayerBeta.exe", StringComparison.OrdinalIgnoreCase)) continue;
+            try { using (var p = Process.GetProcessById(kv.Key)) if (p.ProcessName == "RobloxPlayerBeta" && p.StartTime >= since) p.Kill(); }
+            catch { } // gone already
+        }
+    }
+
+    // "Clean up leftover crash handlers": kills RobloxCrashHandler processes whose client is gone (or whose parent PID now
+    // belongs to a newer program). Anything it can't check is left running. Returns how many it closed.
+    public static int CleanCrashHandlers()
+    {
+        int n = 0;
+        var all = Processes();
+        foreach (var kv in all)
+        {
+            if (kv.Value.Item1 == 0 || !string.Equals(kv.Value.Item2, "RobloxCrashHandler.exe", StringComparison.OrdinalIgnoreCase)) continue;
+            try
+            {
+                using (var child = Process.GetProcessById(kv.Key))
+                {
+                    if (child.ProcessName != "RobloxCrashHandler") continue;
+                    var childStart = child.StartTime;
+                    DateTime? parentStart = null;
+                    if (all.ContainsKey(kv.Value.Item1))
+                        try { using (var parent = Process.GetProcessById(kv.Value.Item1)) parentStart = parent.StartTime; }
+                        catch (ArgumentException) { } // exited a moment ago
+                    if (Program.IsOrphan(childStart, parentStart)) { child.Kill(); n++; }
+                }
+            }
+            catch { } // couldn't check it: leave it running
         }
         return n;
     }
@@ -717,6 +971,15 @@ class MainForm : Form
     readonly Dictionary<long, Image> avatars = new Dictionary<long, Image>();
     System.Threading.Timer poller;
     int polling;
+    readonly object updateLock = new object(); // one Roblox update at a time; a launch never starts under one
+    int userLaunch;                            // 1 = you pressed Play, Launch all or Join: check for a Roblox update first
+    DateTime lastTrim, lastCrashClean;         // Poll thread only
+    DateTime nextAvatars = DateTime.UtcNow.AddHours(8); // Poll thread only; startup already fetches them once
+    NotifyIcon tray;
+    bool exiting, trayTipShown;
+    CheckBox muteCheck;
+    ContextMenuStrip popup;                    // the last right-click menu; disposed when the next one opens
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr h);
 
     NavItem[] nav;
     Panel[] pages;
@@ -724,7 +987,7 @@ class MainForm : Form
     Label status, pageTitle, homeInfo, memText;
     DBPanel grid, memBar;
     ListBox list;
-    readonly Font fName = new Font("Segoe UI Semibold", 12f), fSmall = new Font("Segoe UI", 9.5f), fBtn = new Font("Segoe UI Semibold", 9.5f);
+    readonly Font fName = new Font("Segoe UI Semibold", 12f), fSmall = new Font("Segoe UI", 9.5f), fBtn = new Font("Segoe UI Semibold", 9.5f), fEmpty = new Font("Segoe UI", 13f);
 
     public MainForm(List<Account> loaded)
     {
@@ -755,7 +1018,7 @@ class MainForm : Form
         side.Controls.Add(kill);
         // Docked to the bottom in this order: update button, then version, then Terms of Service underneath.
         updateBtn = new NavItem("Update available") { Dock = DockStyle.Bottom, Height = D(44), TextColor = Theme.Gold, Visible = false };
-        updateBtn.Click += (s, e) => { if (updateBtn.Tag is string) Process.Start((string)updateBtn.Tag); };
+        updateBtn.Click += (s, e) => { if (updateBtn.Tag is string) using (Program.StartNormal(new ProcessStartInfo((string)updateBtn.Tag))) { } };
         side.Controls.Add(updateBtn);
         side.Controls.Add(new Label { Text = "v" + Program.Version, Dock = DockStyle.Bottom, Height = D(20), TextAlign = ContentAlignment.MiddleCenter,
                                       ForeColor = Theme.Muted, Font = new Font("Segoe UI", 8.5f) });
@@ -791,6 +1054,24 @@ class MainForm : Form
         content.BringToFront();
         ShowPage(0);
         SetWindowed(settings.Windowed);
+
+        // Tray icon (right-click for quick actions). With "Close to tray" on, ✕ hides Multi Alt here instead of closing it.
+        tray = new NotifyIcon { Icon = Icon, Text = "Multi Alt", Visible = true, ContextMenuStrip = new ContextMenuStrip() };
+        var tm = tray.ContextMenuStrip;
+        tm.Items.Add("Open Multi Alt", null, (s, e) => ShowFromTray());
+        tm.Items.Add("Launch all", null, (s, e) =>
+        {
+            if (!IsWindowEnabled(Handle)) { ShowFromTray(); return; } // a dialog is open (removing an account, uninstalling...): finish that first
+            LaunchAll();
+            if (!Visible && status.Text != "") tray.ShowBalloonTip(3000, "Multi Alt", status.Text, ToolTipIcon.Info);
+        });
+        var muteItem = tm.Items.Add("Mute Roblox", null, (s, e) => muteCheck.Checked = !muteCheck.Checked);
+        tm.Items.Add("Kill all Roblox", null, (s, e) => { bool free = IsWindowEnabled(Handle); ShowFromTray(); if (free) KillAll(); }); // a dialog already open: just show it
+        tm.Items.Add(new ToolStripSeparator());
+        tm.Items.Add("Exit", null, (s, e) => { if (!IsWindowEnabled(Handle)) { ShowFromTray(); return; } exiting = true; Close(); });
+        tm.Opening += (s, e) => muteItem.Text = muteCheck.Checked ? "Unmute Roblox" : "Mute Roblox";
+        tray.DoubleClick += (s, e) => ShowFromTray();
+        AppDomain.CurrentDomain.UnhandledException += (s, e) => { try { if (tray != null) tray.Visible = false; } catch { } }; // a crash leaves no ghost icon
     }
 
     Button sizeBtn;
@@ -804,7 +1085,7 @@ class MainForm : Form
             var d = Store.Json.Deserialize<Dictionary<string, object>>(RobloxApi.Http("https://api.github.com/repos/TheRealDroidHub/multi-alt/releases/latest", null));
             var tag = d["tag_name"] as string;
             var url = d["html_url"] as string;
-            if (!Program.IsNewer(tag, Program.Version) || url == null || !url.StartsWith("https://github.com/TheRealDroidHub/multi-alt/")) return;
+            if (!Program.IsNewer(tag, Program.Version) || url == null || !url.StartsWith("https://github.com/TheRealDroidHub/multi-alt/", StringComparison.Ordinal)) return;
             BeginInvoke((Action)(() => { updateBtn.Text = "Update available (" + tag + ")"; updateBtn.Tag = url; updateBtn.Visible = true; }));
         }
         catch { } // offline or GitHub down: just no button
@@ -812,60 +1093,124 @@ class MainForm : Form
 
     const string Terms = @"MULTI ALT - TERMS OF SERVICE AND DISCLAIMER
 Developer: Triple DDD
+Last updated: 13 November 2026
 
-By downloading, installing or using Multi Alt (""the Software"") you agree to these terms. If you do not agree, do not use the Software.
+IMPORTANT - PLEASE READ. By downloading, installing, opening, running or using Multi Alt (""the Software"") in any way, you confirm that you have read and understood these terms and that you agree to all of them. Multi Alt asks you to press ""I agree"" before you first use it and again whenever these terms change, but using the Software in any way also means you accept them, even without pressing a button. If you do not agree, do not download, install or use the Software, and delete every copy you have.
+
+""Triple DDD"", ""we"" and ""us"" mean the developer of the Software. ""You"" means the person using the Software. ""Including"" means ""including but not limited to"".
 
 1. WHAT MULTI ALT IS
 Multi Alt is a free, standalone account manager and multi-instance launcher. It lets you sign in to your own Roblox accounts, keep them in one place, and run more than one official Roblox client at the same time on your own computer. That is all it does.
 
 2. WHAT MULTI ALT DOES NOT DO
-Multi Alt does not inject code into, modify, read the memory of, or tamper with the Roblox client or any game. It contains no exploits, cheats, scripts, bots, macros, malware, spyware or tracking of any kind. It does not automate gameplay (see section 3 for the optional Anti-AFK setting). It starts the official Roblox client the same way the Roblox website does, and shows previews of those windows using standard Windows features. The optional FPS cap edits Roblox's own client settings file on your computer, which you can turn off at any time. The optional Auto-rejoin setting (off by default) only relaunches the official Roblox client when one closes by itself, at most 2 times per account in 8 minutes. The optional Mute Roblox setting uses the standard Windows volume mixer.
+Multi Alt does not inject code into the Roblox client or any game, does not patch or change Roblox's program code, and does not read or change Roblox's memory. It contains no exploits, cheats, scripts, bots, macros, malware, spyware or tracking of any kind. It does not play games for you (see section 4 for the optional Anti-AFK setting). It starts the official Roblox client installed on your computer with the same launch link the Roblox website uses, and shows previews of those windows using standard Windows features.
 
-3. ANTI-AFK (OFF BY DEFAULT)
+3. OPTIONAL FEATURES
+You decide whether to use each of these, and you can turn any of them off at any time. Settings marked ""off by default"" stay off until you turn them on.
+- FPS cap (off until you set one): writes a frame rate limit into Roblox's own client settings file (ClientAppSettings.json) for each Roblox version installed on your computer. Setting it back to off removes it.
+- Lower priority for background clients (on by default): uses standard Windows features (lower process priority and Windows efficiency mode) for the Roblox clients you are not playing.
+- RAM cap (off until you set one) and the Free memory now button: ask Windows to trim the memory Roblox clients are using. The RAM cap does this at most every 30 seconds and never to the client you are playing. This does not read or change what is in Roblox's memory.
+- Auto-rejoin (off by default): relaunches the official Roblox client when one closes by itself, at most 2 times per account in 8 minutes.
+- Mute Roblox: uses the standard Windows volume mixer.
+- Keep Roblox updated (off by default): runs Roblox's own official installer when Roblox has a new version, only while no Roblox program is open, and never twice for the same version.
+- Remove old Roblox versions (off by default): deletes only old Roblox player version folders, only while no Roblox program is open, and never the current version or Roblox Studio.
+- Clean up leftover crash handlers (off by default): closes only Roblox crash handler programs whose Roblox client has already closed.
+- Kill all Roblox and Close this client: close Roblox programs the same way ending them in Task Manager does. Anything not yet saved in a game may be lost.
+- Close to tray and Show in Start Menu (off by default): keep Multi Alt running next to the clock, and add a Multi Alt shortcut to your Start Menu that is removed when you turn the setting off.
+
+4. ANTI-AFK (OFF BY DEFAULT)
 Anti-AFK is turned OFF by default. You choose whether to use it. When you turn it on, every 15 minutes Multi Alt briefly switches to each idle Roblox window and presses the Space key once, the same as you tapping Space on your own keyboard. This keeps Roblox from disconnecting you for being idle. It is simple keyboard input emulation only: it does not inject scripts or code into Roblox or any game, does not read or change game memory, and does not play the game for you. It waits until you are not using your mouse or keyboard, skips the window you are playing, and never presses a key unless a Roblox window is in focus.
-How to turn it on or off: open the Performance tab in the sidebar and tick or untick ""Anti-AFK"". You can also press the ""Anti-AFK setting"" button at the bottom of this window to go straight there. Some games or servers may have their own rules about staying idle; using Anti-AFK is at your own discretion and risk (see sections 5 to 7).
+How to turn it on or off: open the Performance tab in the sidebar and tick or untick ""Anti-AFK"". You can also press the ""Anti-AFK setting"" button at the bottom of this window to go straight there. Roblox and some games or servers may have their own rules about staying idle or about automated input; using Anti-AFK is at your own discretion and risk (see sections 7 to 9).
 
-4. YOUR ACCOUNT DATA
-Your account login cookies are stored only on your own computer, encrypted with Windows' built-in data protection for your Windows user. They are sent only to official Roblox servers (roblox.com) to sign you in and launch games. Triple DDD never receives, collects, sells or shares your account data. Never share your accounts.dat file or your login cookies with anyone. If the update check is on (Settings), Multi Alt asks api.github.com for the latest version number when it starts; no account data is sent and nothing is downloaded.
+5. ROBLOX VERSIONS, UPDATES AND YOUR FILES
+Roblox can change its client, installer, launch links, version system and rules at any time without notice, and Multi Alt may stop working, or work differently, because of such a change. Multi Alt tries to start the Roblox version that Roblox reports as current (or hands the launch to your other Roblox launcher if you use one). We do not promise that the Roblox version Multi Alt starts or installs is the newest, the best, the right one for your computer or for any game, or that it will work at all, and we do not promise that any feature will keep working with future versions of Roblox, Windows or Multi Alt.
+Some features change files or programs on your computer (see section 3). You use them at your own risk. Triple DDD is not responsible for any problem with your files, folders, settings, Roblox installation or computer, including failed, partial or unwanted updates, deleted, changed or corrupted files, lost settings, lost unsaved game progress, crashes or freezes, or having to reinstall Roblox or Windows. Keep backups of anything important. If Roblox stops working, you can reinstall it from roblox.com at any time.
+Removing an account, and Remove Multi Alt (especially with BURN), permanently delete data. We cannot recover deleted data.
+New versions of Multi Alt may add, change or remove features, and each one comes with its own terms (see section 16).
 
-5. USE AT YOUR OWN RISK
-The Software is provided ""AS IS"", without warranty of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose and non-infringement. You use it entirely at your own risk and discretion.
+6. YOUR ACCOUNT DATA AND PRIVACY
+Your account logins (and any passwords you choose to save) are stored only on your own computer, in %APPDATA%\MultiAlt, encrypted with Windows' built-in data protection for your Windows user. They are sent only to official Roblox servers (roblox.com) to sign you in, show your account details and launch games. Multi Alt has no servers of its own, and Triple DDD never receives, collects, sells or shares your account data.
+If the update check is on (Settings, on by default), Multi Alt asks api.github.com for the latest version number when it starts; no account data is sent and nothing is downloaded. To start the current Roblox version, Multi Alt asks Roblox (clientsettingscdn.roblox.com) for the current Roblox version number; no login or account data is sent. Profile pictures are downloaded from Roblox's image servers (rbxcdn.com) with no login attached. Login via Roblox and Open in browser use Chrome or Edge on your computer; Open in browser keeps that account's browser login in the Multi Alt folder until you remove the account. If Multi Alt crashes, it writes the error to crash.log in the same folder; it contains no logins and is never sent anywhere.
+Anyone who can use your Windows account, and any malware on your computer, may be able to reach this data. Keeping your computer, your Windows account and your accounts safe is your responsibility. Never share your accounts.dat file, login cookies or passwords with anyone, including anyone who says they are from Multi Alt or Triple DDD.
 
-6. NO RESPONSIBILITY FOR ACCOUNT ACTIONS
-Triple DDD is not responsible or liable for any action taken against your accounts, devices or network, including but not limited to bans, suspensions, terminations, warnings, account flags, moderation actions, bot or alt detections, IP bans, rate limits, loss of items, currency, progress or data, or any other decision made by Roblox Corporation or any game developer. We do not cover, insure, guarantee, restore or compensate any account for any reason.
+7. USE AT YOUR OWN RISK - NO WARRANTY
+The Software is provided ""AS IS"" and ""AS AVAILABLE"", without warranty of any kind, express or implied, including warranties of merchantability, fitness for a particular purpose, title and non-infringement. We do not promise that the Software is free of bugs, errors or security issues, that it will be compatible with your computer or with Roblox, or that it will keep working or keep being updated. You use it entirely at your own risk and discretion.
 
-7. YOUR DUE DILIGENCE
-It is your responsibility to follow the Roblox Terms of Use, Community Standards and the rules of every game you play. It is at your own discretion how many accounts you run at once. Running a large number of accounts may lead to rate limiting, bot or alt detection, IP restrictions or other actions by Roblox. Use a reasonable number of accounts and use the Software responsibly.
+8. NO RESPONSIBILITY FOR BANS OR ANY ACCOUNT ACTION
+Triple DDD is not responsible or liable for any action taken against your accounts, devices or network by Roblox Corporation, any game developer or anyone else, for any reason. This includes temporary or permanent bans, suspensions, terminations, warnings, account flags, moderation actions, bot or alt detection, IP or device bans, rate limits, verification checks, login problems, and loss of items, Robux, currency, progress, data or account value. It also includes any action taken because you used third-party software, ran several accounts or clients at once, used Anti-AFK or any other feature of Multi Alt, or broke a rule of Roblox or of a game, whether or not you knew about that rule. We cannot reverse or appeal these actions for you, and we do not cover, insure, guarantee, restore, refund or compensate any account for any reason.
 
-8. NO AFFILIATION
-Multi Alt and Triple DDD are not affiliated with, endorsed by, sponsored by or connected to Roblox Corporation. ""Roblox"" and related names and logos are trademarks of Roblox Corporation. We are also not affiliated with GitHub, Microsoft, Google, Valve/Steam or any other gaming or technology company. Multi Alt is made by an independent, standalone developer.
+9. YOUR RESPONSIBILITIES
+You are responsible for following the Roblox Terms of Use, the Roblox Community Standards, the rules of every game you play and the laws that apply to you. Only add accounts that belong to you. It is your choice how many accounts you run at once; running many accounts may lead to rate limits, bot or alt detection, IP restrictions or other actions by Roblox. Use a reasonable number of accounts and use the Software responsibly. You are responsible for everything done with the Software on your computer and accounts.
 
-9. OPEN SOURCE
-Multi Alt is open source. Anyone may read the full source code to confirm exactly what it does. Only download Multi Alt from the official source; copies from anywhere else may have been modified and are not supported.
+10. THIRD-PARTY SOFTWARE AND SERVICES
+Multi Alt works with software and services made by others, including Roblox (its client, installer and servers), Windows, Chrome, Edge, GitHub and any other Roblox launcher you use. We do not control them and are not responsible for how they work, what they do with your data, or any change, outage or problem they cause. Your use of them is covered by their own terms.
 
-10. LIMITATION OF LIABILITY
-To the maximum extent permitted by law, in no event shall Triple DDD be liable for any direct, indirect, incidental, special, consequential or exemplary damages, or any loss of accounts, data, profits or goodwill, arising from or related to your use of or inability to use the Software, even if advised of the possibility of such damages.
+11. NO AFFILIATION
+Multi Alt and Triple DDD are not affiliated with, endorsed by, sponsored by or connected to Roblox Corporation. ""Roblox"" and related names and logos are trademarks of Roblox Corporation. We are also not affiliated with GitHub, Microsoft, Google, Valve/Steam, Bloxstrap, Fishstrap or any other company or project. Multi Alt is made by an independent, standalone developer.
 
-11. CHANGES
-These terms may be updated with new versions of the Software. Continuing to use the Software after an update means you accept the updated terms.";
+12. OPEN SOURCE AND OFFICIAL DOWNLOADS
+Multi Alt is free and open source under the MIT License. Anyone may read the full source code to check exactly what it does. The only official download is the Releases page of the official Multi Alt GitHub repository (the page the Update available button opens). Copies from anywhere else, and versions changed or rebuilt by anyone else, may have been modified, may be unsafe and are not supported, and Triple DDD is not responsible for them. If anyone sells you Multi Alt, or asks for your login, password or cookie so you can use it, it is a scam.
 
-    void ShowTerms()
+13. LIMITATION OF LIABILITY
+To the maximum extent permitted by law, in no event shall Triple DDD be liable for any direct, indirect, incidental, special, consequential, punitive or exemplary damages, or for any loss of accounts, items, Robux, data, files, profits or goodwill, or any damage to your computer, arising from or related to the Software or these terms, or your use of or inability to use the Software, under any legal theory (contract, negligence or otherwise), even if advised of the possibility of such damages. If any liability cannot be excluded, our total liability to you for all claims together is limited to the amount you paid for the Software, which is nothing, because it is free.
+
+14. INDEMNITY
+To the extent the law allows, you agree to defend, indemnify and hold harmless Triple DDD from any claims, damages, losses, costs and expenses (including reasonable legal fees) that arise from your use or misuse of the Software, your accounts, or your breaking of these terms, the Roblox Terms of Use or any law.
+
+15. AGE
+If you are under the age of legal adulthood where you live, you may only use the Software with the permission of a parent or legal guardian, who agrees to these terms for you and is responsible for your use of it. You must also meet Roblox's own age rules.
+
+16. CHANGES TO THESE TERMS
+We may change these terms in any new version of the Software. The terms shown in the version you are using are the terms that apply to it, and using a new version means you accept its terms. When the terms change, Multi Alt shows them again and does not open until you press ""I agree"". We may change, pause or stop working on the Software at any time without notice.
+
+17. GENERAL
+Some places do not allow certain warranties or liability to be excluded or limited. In those places, these terms exclude and limit them only as far as the law allows, and nothing in these terms takes away rights you have by law that cannot be waived. If any part of these terms is found invalid or unenforceable, that part is limited or removed only as much as needed and the rest stays in full effect. If we do not enforce any part of these terms, we have not given up the right to enforce it later. The MIT License (the LICENSE file in the official repository) governs your rights to copy, change and share the source code; if it and these terms conflict about those rights, the MIT License wins. These terms and the MIT License are the whole agreement between you and Triple DDD about the Software. Sections 5, 7, 8, 13, 14 and 17 keep applying after you stop using or delete the Software.";
+
+    void ShowTerms() { TermsForm(this, false, () => { ShowPage(2); afkBox.Focus(); }); }
+
+    // First run, and again whenever the Terms text changes: Multi Alt doesn't open until you press "I agree".
+    public static readonly string TermsId = Program.TermsHash(Terms);
+    public static bool AgreeToTerms(AppSettings s)
     {
-        using (var f = new Form { Text = "Multi Alt - Terms of Service", BackColor = Theme.Bg, Icon = Icon, StartPosition = FormStartPosition.CenterParent,
-                                  Size = new Size(D(720), D(640)), MinimizeBox = false, ShowInTaskbar = false })
+        if (s.AcceptedTerms == TermsId) return true;
+        if (!TermsForm(null, true, null)) return false;
+        s.AcceptedTerms = TermsId;
+        try { Store.SaveSettings(s); } catch { } // couldn't save: they're just asked again next time
+        return true;
+    }
+
+    // mustAgree: "I agree" / "I don't agree" buttons, and closing the window counts as not agreeing. Returns true only on "I agree".
+    static bool TermsForm(Form owner, bool mustAgree, Action toAfk)
+    {
+        bool agreed = false;
+        var wa = (owner != null ? Screen.FromControl(owner) : Screen.FromPoint(MousePosition)).WorkingArea; // never bigger than the screen, or I agree could end up under the taskbar
+        using (var f = new Form { Text = "Multi Alt - Terms of Service", BackColor = Theme.Bg, StartPosition = owner != null ? FormStartPosition.CenterParent : FormStartPosition.CenterScreen,
+                                  Size = new Size(Math.Min(D(720), wa.Width), Math.Min(D(640), wa.Height)), MinimizeBox = false, ShowInTaskbar = owner == null })
         {
+            try { f.Icon = owner != null ? owner.Icon : Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             var box = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, BorderStyle = BorderStyle.None,
                                     BackColor = Theme.Card, ForeColor = Theme.Fg, Font = new Font("Segoe UI", 10.5f), Text = Terms.Replace("\r\n", "\n").Replace("\n", "\r\n") };
             var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = D(52), FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(D(10)), BackColor = Theme.Bg };
-            bottom.Controls.Add(Theme.Btn("I understand", Theme.Gold, (s, e) => f.Close()));
-            bottom.Controls.Add(Theme.Btn("Anti-AFK setting", Theme.Card2, (s, e) => { f.Close(); ShowPage(2); afkBox.Focus(); }));
             var pad = new Panel { Dock = DockStyle.Fill, Padding = new Padding(D(16)), BackColor = Theme.Card };
             pad.Controls.Add(box);
             f.Controls.Add(pad);
-            f.Controls.Add(bottom);
-            f.Shown += (s, e) => { box.SelectionLength = 0; box.SelectionStart = 0; };
-            f.ShowDialog(this);
+            if (mustAgree)
+            {
+                bottom.Controls.Add(Theme.Btn("I agree", Theme.Gold, (s, e) => { agreed = true; f.Close(); }));
+                bottom.Controls.Add(Theme.Btn("I don't agree", Theme.Card2, (s, e) => f.Close()));
+                f.Controls.Add(new Label { Text = "Read the terms above. Pressing I agree means you have read, understood and agree to them.", Dock = DockStyle.Bottom,
+                                           Height = D(30), TextAlign = ContentAlignment.MiddleCenter, ForeColor = Theme.Muted, BackColor = Theme.Bg, Font = new Font("Segoe UI", 9.5f) });
+            }
+            else
+            {
+                bottom.Controls.Add(Theme.Btn("I understand", Theme.Gold, (s, e) => f.Close()));
+                bottom.Controls.Add(Theme.Btn("Anti-AFK setting", Theme.Card2, (s, e) => { f.Close(); toAfk(); }));
+            }
+            f.Controls.Add(bottom); // added last so it docks at the very bottom, under the note
+            f.Shown += (s, e) => { box.SelectionLength = 0; box.SelectionStart = 0; f.Activate(); };
+            f.ShowDialog(owner);
         }
+        return agreed;
     }
 
     // Fullscreen = borderless and maximised; windowed = a normal resizable window at 3/4 of the screen.
@@ -893,6 +1238,10 @@ These terms may be updated with new versions of the Software. Continuing to use 
         new Thread(AntiAfkLoop) { IsBackground = true, Priority = ThreadPriority.BelowNormal }.Start();
         if (settings.CheckUpdates) new Thread(CheckForUpdate) { IsBackground = true }.Start();
         if (settings.FpsCap > 0) new Thread(() => FpsTweak.Apply(settings.FpsCap)) { IsBackground = true }.Start(); // Roblox updates make new version folders
+        if (Program.Elevated()) status.Text = Program.AdminWarning;
+        if (settings.KeepRobloxUpdated) new Thread(() => { try { EnsureRobloxUpdated(); } catch { } }) { IsBackground = true }.Start();
+        if (Program.ShowSignal != null) new Thread(WaitForShowSignal) { IsBackground = true }.Start();
+        if (settings.StartMenuShortcut) try { Program.SetStartMenu(true); } catch { } // keeps it pointing at this exe if you moved it
         poller = new System.Threading.Timer(_ => Poll(), null, 300, 2000);
     }
 
@@ -900,6 +1249,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
     {
         lock (pidAccount) // also keeps the launch and poll threads from writing the file at the same time
         {
+            if (Store.Frozen) return;
             var lines = new List<string>();
             foreach (var kv in pidAccount) try { if (kv.Value.UserId > 0) lines.Add(Store.RunningLine(kv.Key, kv.Value.UserId)); } catch { }
             try { Directory.CreateDirectory(Store.Dir); File.WriteAllLines(Store.RunningFile, lines); } catch { }
@@ -922,6 +1272,13 @@ These terms may be updated with new versions of the Software. Continuing to use 
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        if (!exiting && settings.CloseToTray && e.CloseReason == CloseReason.UserClosing && tray != null)
+        {
+            e.Cancel = true; // "Close to tray": keep running, the tray icon brings it back
+            Hide();
+            if (!trayTipShown) { trayTipShown = true; tray.ShowBalloonTip(4000, "Multi Alt is still running", "Double-click the tray icon to open it. Right-click it to exit.", ToolTipIcon.Info); }
+            return;
+        }
         if (poller != null) poller.Dispose();
         if (settings.MuteRoblox) try { RobloxAudio.SetMute(RobloxPids(), false); } catch { } // Windows can remember per-app mute; don't leave Roblox silent
         // Give running clients their taskbar buttons back and bring them onto the main screen, cascaded.
@@ -938,6 +1295,30 @@ These terms may be updated with new versions of the Software. Continuing to use 
         thumbs.Clear();
         base.OnFormClosing(e);
     }
+
+    protected override void OnFormClosed(FormClosedEventArgs e) { DisposeTray(); base.OnFormClosed(e); }
+
+    void DisposeTray()
+    {
+        if (tray == null) return;
+        var m = tray.ContextMenuStrip; // NotifyIcon doesn't dispose its menu
+        tray.Visible = false;
+        tray.Dispose();
+        if (m != null) m.Dispose();
+        tray = null;
+    }
+
+    void ShowFromTray()
+    {
+        if (IsDisposed) return;
+        Show();
+        if (WindowState == FormWindowState.Minimized) WindowState = settings.Windowed ? FormWindowState.Normal : FormWindowState.Maximized;
+        Activate();
+        RefreshUi();
+    }
+
+    // A second copy of Multi Alt sets this signal instead of running twice: show this one.
+    void WaitForShowSignal() { try { while (Program.ShowSignal.WaitOne()) BeginInvoke((Action)ShowFromTray); } catch { } }
 
     void ShowPage(int i)
     {
@@ -1026,7 +1407,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
         g.SmoothingMode = SmoothingMode.AntiAlias;
         if (homeCells.Count == 0)
         {
-            TextRenderer.DrawText(g, "No Roblox clients running.\nGo to Accounts and press Play or Launch all.", new Font("Segoe UI", 13f), grid.ClientRectangle, Theme.Muted,
+            TextRenderer.DrawText(g, "No Roblox clients running.\nGo to Accounts and press Play or Launch all.", fEmpty, grid.ClientRectangle, Theme.Muted,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             return;
         }
@@ -1055,12 +1436,12 @@ These terms may be updated with new versions of the Software. Continuing to use 
         var c = homeClients[i];
         if (e.Button == MouseButtons.Right)
         {
-            var menu = new ContextMenuStrip();
+            var menu = NewPopup();
             menu.Items.Add("Play this window", null, (a, b) => FocusClient(c.Hwnd));
             menu.Items.Add("Close this client", null, (a, b) =>
             {
                 if (c.Account != null) userClosed.Add(c.Account); // you closed it, so auto-rejoin leaves it closed
-                try { Process.GetProcessById(c.Pid).Kill(); } catch { }
+                try { using (var p = Process.GetProcessById(c.Pid)) if (p.ProcessName == "RobloxPlayerBeta") p.Kill(); } catch { } // already closed: its PID may be another program now
             });
             menu.Show(grid, e.Location);
         }
@@ -1083,9 +1464,10 @@ These terms may be updated with new versions of the Software. Continuing to use 
     void Poll()
     {
         if (Interlocked.Exchange(ref polling, 1) == 1) return;
+        Process[] procs = null;
         try
         {
-            var procs = Process.GetProcessesByName("RobloxPlayerBeta");
+            procs = Process.GetProcessesByName("RobloxPlayerBeta");
             uint fgPid;
             GetWindowThreadProcessId(GetForegroundWindow(), out fgPid);
             var pids = new HashSet<int>(procs.Select(p => p.Id));
@@ -1120,9 +1502,12 @@ These terms may be updated with new versions of the Software. Continuing to use 
                 catch { } // process exited mid-read
             }
             long cap = settings.RamCapGb * GB;
-            if (cap > 0 && total > cap) // over the cap: push background clients' memory out to the page file
-                foreach (var p in procs) if (p.Id != fgPid) try { EmptyWorkingSet(p.Handle); } catch { }
-            foreach (var p in procs) p.Dispose();
+            if (cap > 0 && total > cap && Program.Due(lastTrim, now, 30)) // over the cap: push background clients' memory out to the page file, at most every 30 s
+            {
+                lastTrim = now;
+                foreach (var p in procs) if (p.Id != fgPid) try { EmptyWorkingSet(p.Handle); } catch { } // never the one you're playing
+            }
+            if (settings.CleanCrashHandlers && Program.Due(lastCrashClean, now, 30)) { lastCrashClean = now; try { RobloxInstall.CleanCrashHandlers(); } catch { } }
             cpuPrev = cpuNow;
             cpuAt = now;
             robloxCpu = cpuTotal;
@@ -1148,17 +1533,24 @@ These terms may be updated with new versions of the Software. Continuing to use 
                 }
             }
             if (fresh && IsHandleCreated && !IsDisposed)
-                BeginInvoke((Action)(() => { if (playing == IntPtr.Zero && WindowState != FormWindowState.Minimized) Activate(); })); // don't yank you out of a game
+                BeginInvoke((Action)(() => { if (playing == IntPtr.Zero && Visible && WindowState != FormWindowState.Minimized) Activate(); })); // don't yank you out of a game
             clients = list;
             Interlocked.Exchange(ref robloxRam, total);
             if (IsHandleCreated && !IsDisposed) BeginInvoke((Action)RefreshUi);
+            if (now >= nextAvatars) { nextAvatars = now.AddHours(8); new Thread(RefreshAccountInfo) { IsBackground = true }.Start(); } // profile pictures change
         }
         catch { }
-        finally { polling = 0; }
+        finally
+        {
+            if (procs != null) foreach (var p in procs) p.Dispose();
+            polling = 0;
+        }
     }
 
     void RefreshUi()
     {
+        if (tray != null) tray.Text = "Multi Alt · " + clients.Count + " running";
+        if (!Visible) return; // in the tray: nothing to draw
         UpdateThumbs();
         long limit = settings.RamCapGb > 0 ? settings.RamCapGb * GB : installedRam;
         memText.Text = "Roblox is using " + Gb(Interlocked.Read(ref robloxRam)) + " GB across " + clients.Count + " clients  •  limit "
@@ -1176,12 +1568,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
         var bar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(D(18), D(6), 0, D(6)), BackColor = Theme.Bg };
         bar.Controls.Add(Theme.Btn("+  Add account", Theme.Gold, AddAccountDialog));
         bar.Controls.Add(Theme.Btn("Login via Roblox", Theme.Blue, (s, e) => LoginViaRoblox()));
-        bar.Controls.Add(Theme.Btn("▶  Launch all", Theme.Card, (s, e) =>
-        {
-            var ticked = accounts.Where(a => !a.Skip).ToList();
-            if (ticked.Count == 0) status.Text = "No accounts are ticked. Tick the box on the left of a card to include it in Launch all.";
-            else QueueLaunch(ticked);
-        }));
+        bar.Controls.Add(Theme.Btn("▶  Launch all", Theme.Card, (s, e) => LaunchAll()));
         var stop = Theme.Btn("■  Stop launching", Theme.Card, (s, e) => { StopLaunching(); status.Text = "Launch queue cleared."; });
         bar.Controls.Add(stop);
         bar.SetFlowBreak(stop, true); // rows: buttons / game link / follow-join, so a label never ends up on a different row than its box
@@ -1355,6 +1742,14 @@ These terms may be updated with new versions of the Software. Continuing to use 
         return img;
     }
 
+    // Drops a cached profile picture so the next paint reloads it; deleteFile also removes it from disk (account removed).
+    void ForgetAvatar(long id, bool deleteFile)
+    {
+        Image img;
+        if (avatars.TryGetValue(id, out img)) { avatars.Remove(id); if (img != null) img.Dispose(); }
+        if (deleteFile && id > 0) try { File.Delete(Path.Combine(Store.AvatarDir, id + ".png")); } catch { }
+    }
+
     void AccountClick(object s, MouseEventArgs e)
     {
         int i = list.IndexFromPoint(e.Location);
@@ -1371,9 +1766,16 @@ These terms may be updated with new versions of the Software. Continuing to use 
         else if (CopyRect(card, a).Contains(e.Location)) CopyMenu(a, new Point(CopyRect(card, a).X, CopyRect(card, a).Bottom));
         else if (XRect(card).Contains(e.Location))
         {
-            if (MessageBox.Show(this, "Remove " + Title(a) + "?\nYou'll need to log in again to add it back.", "Multi Alt", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            if (MessageBox.Show(this, "Remove " + Title(a) + "?\nYou'll need to log in again to add it back. Its Open in browser window's login is deleted too.",
+                                "Multi Alt", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             accounts.Remove(a);
             Store.Save(accounts);
+            if (a.UserId > 0 && !accounts.Any(x => x.UserId == a.UserId)) // its picture and its browser profile (a login) go too
+            {
+                ForgetAvatar(a.UserId, true);
+                var profile = Path.Combine(Store.Dir, "browser", a.UserId.ToString());
+                ThreadPool.QueueUserWorkItem(_ => { try { if (Directory.Exists(profile)) Directory.Delete(profile, true); } catch { } }); // still open: retried at the next start
+            }
             RefreshList();
         }
         else if (PlayRect(card).Contains(e.Location)) QueueLaunch(new List<Account> { a });
@@ -1434,7 +1836,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
                     if (existing != null) existing.Cookie = cookie; // re-login refreshes the cookie instead of duplicating
                     else { u.Name = nick == "" ? u.Username : nick; u.Cookie = cookie; accounts.Add(u); }
                     Store.Save(accounts);
-                    avatars.Remove(u.UserId);
+                    ForgetAvatar(u.UserId, false); // just downloaded: show the new one
                     RefreshList();
                     status.Text = (existing != null ? "Updated " : "Added ") + u.DisplayName + " (@" + u.Username + ").";
                 }));
@@ -1443,7 +1845,8 @@ These terms may be updated with new versions of the Software. Continuing to use 
         }) { IsBackground = true }.Start();
     }
 
-    // Fills in username/avatar for accounts added before that info existed, and any missing avatars.
+    // At startup and every 8 hours: fills in username/ID for accounts added before that info existed, re-downloads profile
+    // pictures older than 8 hours, and deletes the pictures and browser profiles of removed accounts.
     void RefreshAccountInfo()
     {
         try
@@ -1460,16 +1863,36 @@ These terms may be updated with new versions of the Software. Continuing to use 
                 }
                 catch { }
             }
-            var missing = snap.Where(x => x.UserId > 0 && !File.Exists(Path.Combine(Store.AvatarDir, x.UserId + ".png"))).Select(x => x.UserId).ToList();
-            if (missing.Count > 0) try { RobloxApi.FetchAvatars(missing); } catch { }
-            BeginInvoke((Action)(() => { Store.Save(accounts); list.Invalidate(); }));
+            var now = DateTime.UtcNow;
+            var ids = new HashSet<long>(snap.Where(x => x.UserId > 0).Select(x => x.UserId));
+            // a removed account's leftovers, untouched for an hour (so one being added right now is kept)
+            Func<string, DateTime, bool> leftover = (name, written) => { long id; return long.TryParse(name, out id) && !ids.Contains(id) && now - written > TimeSpan.FromHours(1); };
+            if (Directory.Exists(Store.AvatarDir))
+                foreach (var f in Directory.GetFiles(Store.AvatarDir, "*.png"))
+                    if (leftover(Path.GetFileNameWithoutExtension(f), File.GetLastWriteTimeUtc(f))) try { File.Delete(f); } catch { }
+            var browsers = Path.Combine(Store.Dir, "browser");
+            if (Directory.Exists(browsers))
+                foreach (var d in Directory.GetDirectories(browsers))
+                    if (leftover(Path.GetFileName(d), Directory.GetLastWriteTimeUtc(d))) try { Directory.Delete(d, true); } catch { } // its window still open: next time
+            // a missing picture reads as written in 1601, so it's fetched too
+            var stale = ids.Where(id => now - File.GetLastWriteTimeUtc(Path.Combine(Store.AvatarDir, id + ".png")) >= TimeSpan.FromHours(8)).ToList();
+            if (stale.Count > 0) try { RobloxApi.FetchAvatars(stale); } catch { }
+            BeginInvoke((Action)(() => { foreach (var id in stale) ForgetAvatar(id, false); Store.Save(accounts); list.Invalidate(); }));
         }
         catch { }
+    }
+
+    void LaunchAll()
+    {
+        var ticked = accounts.Where(a => !a.Skip).ToList();
+        if (ticked.Count == 0) status.Text = "No accounts are ticked. Tick the box on the left of a card to include it in Launch all.";
+        else QueueLaunch(ticked);
     }
 
     // target: null = the Game link box, else a PlaceLauncher request (used by Follow/Join). Pressing Play resets auto-rejoin for that account.
     void QueueLaunch(List<Account> chosen, string target = null)
     {
+        if (chosen.Any(a => !IsRunning(a))) Interlocked.Exchange(ref userLaunch, 1); // set before queueing, so the worker sees it
         int n = 0;
         foreach (var a in chosen)
         {
@@ -1639,9 +2062,12 @@ These terms may be updated with new versions of the Software. Continuing to use 
         Clipboard.SetDataObject(d, true);
     }
 
+    // Right-click menus: each new one frees the last, so opening hundreds doesn't pile up window handles.
+    ContextMenuStrip NewPopup() { if (popup != null) popup.Dispose(); return popup = new ContextMenuStrip(); }
+
     void CopyMenu(Account a, Point at)
     {
-        var menu = new ContextMenuStrip();
+        var menu = NewPopup();
         bool hasCombo = !string.IsNullOrEmpty(a.Password) && !string.IsNullOrEmpty(a.Username);
         var combo = menu.Items.Add(hasCombo ? "Copy combo (username:password)" : "Copy combo - no password saved", null, (s, e) =>
         {
@@ -1695,6 +2121,103 @@ These terms may be updated with new versions of the Software. Continuing to use 
         return 0;
     }
 
+    // Starts the live Roblox client straight from its folder, so an old client never runs Roblox's updater (the blue screen
+    // that closes running alts). Uses the roblox-player: link instead when another launcher (Bloxstrap...) owns those links,
+    // the live version isn't installed yet, or the start fails. False = used the link.
+    static bool StartClient(string uri)
+    {
+        var handler = RobloxInstall.HandlerExe("roblox-player");
+        if (handler == null || RobloxInstall.VersionOf(handler) != null)
+        {
+            var exe = RobloxInstall.ClientExe(RobloxInstall.LiveVersion(false));
+            if (exe != null && RobloxInstall.SafeArg(uri))
+                try { using (Program.StartNormal(new ProcessStartInfo(exe, uri) { WorkingDirectory = Path.GetDirectoryName(exe) })) { } return true; }
+                catch { }
+        }
+        using (Program.StartNormal(new ProcessStartInfo(uri))) { }
+        return false;
+    }
+
+    // "Keep Roblox updated" (off by default), on a background thread at startup and before Play, Launch all and Join.
+    // When Roblox has a new version and no Roblox program is open (checked twice), it runs Roblox's own installer alone and
+    // waits for it, so launches never hit the update screen that closes running alts. Never twice for the same version.
+    void EnsureRobloxUpdated()
+    {
+        if (!settings.KeepRobloxUpdated) return;
+        lock (updateLock) // launches wait while this runs
+        {
+            try
+            {
+                var live = RobloxInstall.LiveVersion(true);
+                if (live == null) { SetStatus("Couldn't check for a Roblox update: Roblox didn't answer."); return; }
+                if (RobloxInstall.VersionOf(RobloxInstall.HandlerExe("roblox-player")) == null)
+                {
+                    SetStatus("Roblox links on this PC don't open the normal Roblox install, so Multi Alt leaves Roblox updates alone.");
+                    return;
+                }
+                if (RobloxInstall.ClientExe(live) != null) { var msg = RemoveOldVersions(live); if (msg != null) SetStatus(msg); return; } // up to date
+                if (settings.LastRobloxUpdateVersion == live) return; // already ran the installer for this version: never twice
+                if (Program.Elevated()) { SetStatus(Program.AdminWarning + " Roblox update skipped."); return; }
+                if (settings.CleanCrashHandlers) try { if (RobloxInstall.CleanCrashHandlers() > 0) Thread.Sleep(1500); } catch { } // let them close
+                var open = RobloxInstall.Running();
+                if (open == null) { Thread.Sleep(1000); open = RobloxInstall.Running(); }
+                if (open != null)
+                {
+                    SetStatus("Roblox has an update. Multi Alt installs it when no Roblox program is open (" + open + " is)."
+                              + (open == "RobloxCrashHandler" && !settings.CleanCrashHandlers ? " Tip: Settings > Clean up leftover crash handlers." : ""));
+                    return;
+                }
+                var installer = RobloxInstall.Installer();
+                if (installer == null) { SetStatus("Roblox has an update, but Roblox's installer wasn't found."); return; }
+                bool ok = false;
+                for (int attempt = 1; attempt <= 2 && !ok; attempt++)
+                {
+                    if (attempt == 2 && RobloxInstall.Running() != null) break; // something Roblox opened meanwhile
+                    SetStatus(attempt == 1 ? "Updating Roblox. Launches wait until it's done..." : "Roblox didn't finish updating. Trying once more...");
+                    var started = DateTime.Now; // Process.StartTime is local time
+                    var seen = new HashSet<int>();
+                    using (var p = Program.StartNormal(new ProcessStartInfo(installer) { WorkingDirectory = Path.GetDirectoryName(installer) }))
+                        if (p != null) seen.Add(p.Id);
+                    RobloxInstall.WaitForInstaller(TimeSpan.FromMinutes(10), seen);
+                    Thread.Sleep(2000);
+                    RobloxInstall.CloseOpenedBy(seen, started); // it may open Roblox when it's done; that window isn't one of your accounts
+                    ok = RobloxInstall.ClientExe(live) != null;
+                }
+                settings.LastRobloxUpdateVersion = live;
+                if (IsHandleCreated && !IsDisposed) BeginInvoke((Action)(() => Store.SaveSettings(settings)));
+                if (ok)
+                {
+                    if (settings.FpsCap > 0) FpsTweak.Apply(settings.FpsCap);
+                    SetStatus("Roblox updated. " + (RemoveOldVersions(live) ?? ""));
+                    return;
+                }
+                const string fail = "Roblox didn't finish updating, so launches use Roblox's own updater. To try again, untick and tick Keep Roblox updated.";
+                SetStatus(fail);
+                if (IsHandleCreated && !IsDisposed) BeginInvoke((Action)(() => { if (tray != null) tray.ShowBalloonTip(5000, "Multi Alt", fail, ToolTipIcon.Warning); }));
+            }
+            catch (Exception ex) { SetStatus("Roblox update check: " + ex.Message); }
+        }
+    }
+
+    // "Remove old Roblox versions" (off by default, needs Keep Roblox updated): deletes old player folders in Roblox\Versions once
+    // the current version is installed and no Roblox program is open. Keeps the current version, the folders Roblox's links and
+    // its uninstall entry use, Studio, links and anything it can't read. Returns what to show, or null when there's nothing to say.
+    string RemoveOldVersions(string live)
+    {
+        if (!settings.KeepRobloxUpdated || !settings.RemoveOldRobloxVersions || RobloxInstall.ClientExe(live) == null) return null;
+        var link = RobloxInstall.VersionOf(RobloxInstall.HandlerExe("roblox-player"));
+        if (link == null) return "Old Roblox versions kept: Roblox links don't open the normal Roblox install.";
+        var old = RobloxInstall.PickOld(RobloxInstall.Scan(), new[] { live, link, RobloxInstall.VersionOf(RobloxInstall.HandlerExe("roblox")),
+                                                                      RobloxInstall.VersionOf(RobloxInstall.UninstallerExe()) });
+        if (old.Count == 0) return null;
+        if (RobloxInstall.Running() != null) return "Old Roblox versions will be removed when no Roblox program is open.";
+        int n = 0;
+        foreach (var name in old)
+            try { Directory.Delete(Path.Combine(RobloxInstall.Root, name), true); n++; }
+            catch { } // a file in use: tried again next time
+        return "Removed " + n + " old Roblox version(s)." + (n < old.Count ? " " + (old.Count - n) + " in use, kept for next time." : "");
+    }
+
     // One background worker launches the queue in order, so clicking Play on many accounts never floods Roblox.
     void LaunchWorker()
     {
@@ -1702,6 +2225,7 @@ These terms may be updated with new versions of the Software. Continuing to use 
         {
             try
             {
+                if (Interlocked.Exchange(ref userLaunch, 0) == 1) EnsureRobloxUpdated(); // you pressed Play, Launch all or Join
                 if (IsRunning(a)) continue;
                 long cap = settings.RamCapGb * GB;
                 if (cap > 0 && Interlocked.Read(ref robloxRam) + GB > cap)
@@ -1722,9 +2246,16 @@ These terms may be updated with new versions of the Software. Continuing to use 
                     continue;
                 }
 
-                SetStatus("Launching " + Title(a) + "  (" + launchQueue.Count + " more queued)...");
-                var before = RobloxPids();
-                Process.Start(RobloxApi.BuildUri(RobloxApi.GetTicket(a.Cookie), query));
+                HashSet<int> before;
+                lock (updateLock) // waits out a Roblox update, and keeps one from starting under this launch
+                {
+                    if (RobloxInstall.IsOpen("RobloxPlayerInstaller")) { SetStatus("Waiting for Roblox to finish updating..."); RobloxInstall.WaitForInstaller(TimeSpan.FromMinutes(3), null); }
+                    if (settings.FpsCap > 0) FpsTweak.Apply(settings.FpsCap); // a Roblox update makes a new folder without it
+                    SetStatus("Launching " + Title(a) + "  (" + launchQueue.Count + " more queued)...");
+                    var uri = RobloxApi.BuildUri(RobloxApi.GetTicket(a.Cookie), query); // ticket after the waits, so it's fresh
+                    before = RobloxPids();
+                    StartClient(uri);
+                }
                 // Roblox first runs a short-lived launcher process, so wait (up to 60s) for a new one that has a game window.
                 for (int t = 0; t < 120; t++)
                 {
@@ -1767,8 +2298,8 @@ These terms may be updated with new versions of the Software. Continuing to use 
         add(memBar, D(34));
 
         add(Theme.Lbl("RAM cap", 12, Theme.Fg, true), D(30));
-        add(note("Multi Alt won't launch more clients once Roblox reaches the cap, and squeezes background clients' memory when they go over it. "
-               + "Your PC has " + Gb(installedRam) + " GB, so bigger sizes are greyed out."), D(46));
+        add(note("Multi Alt won't launch more clients once Roblox reaches the cap, and squeezes background clients' memory when they go over it "
+               + "(at most every 30 s, never the one you're playing). Your PC has " + Gb(installedRam) + " GB, so bigger sizes are greyed out."), D(46));
         add(Choices(new[] { 0, 8, 16, 24, 32, 48, 64, 96 }, v => v == 0 ? "No cap" : v + " GB", v => Program.RamAllowed(v, installedRam),
                     () => settings.RamCapGb, v => { settings.RamCapGb = v; Store.SaveSettings(settings); RefreshUi(); }), D(56));
         add(Theme.Btn("Free memory now", Theme.Card, (s, e) => TrimAll()), D(56));
@@ -1855,18 +2386,39 @@ These terms may be updated with new versions of the Software. Continuing to use 
                   settings.AutoRejoin, v => { settings.AutoRejoin = v; Store.SaveSettings(settings); }), D(56));
 
         add(Theme.Lbl("AUDIO", 9, Theme.Gold, true), D(28));
-        add(check("Mute Roblox: hard-mute every Roblox client in the Windows volume mixer (unmutes when you untick this or close Multi Alt).",
+        add(muteCheck = check("Mute Roblox: hard-mute every Roblox client in the Windows volume mixer (unmutes when you untick this or close Multi Alt).",
                   settings.MuteRoblox, v =>
                   {
                       settings.MuteRoblox = v; Store.SaveSettings(settings);
                       ThreadPool.QueueUserWorkItem(_ => { try { RobloxAudio.SetMute(RobloxPids(), v); } catch { } });
                   }), D(56));
 
+        add(Theme.Lbl("ROBLOX UPDATES", 9, Theme.Gold, true), D(28));
+        CheckBox oldBox = null;
+        add(check("Keep Roblox updated (off by default): when Roblox has an update and no Roblox program is open, run Roblox's own installer before launching, so the update screen can't close running alts.",
+                  settings.KeepRobloxUpdated, v => { settings.KeepRobloxUpdated = v; settings.LastRobloxUpdateVersion = null; Store.SaveSettings(settings); oldBox.Enabled = v; }), D(56));
+        add(oldBox = check("Remove old Roblox versions (off by default, needs the option above): delete old Roblox player folders when no Roblox program is open. Never touches Studio, the current version or other launchers.",
+                  settings.RemoveOldRobloxVersions, v => { settings.RemoveOldRobloxVersions = v; Store.SaveSettings(settings); }), D(56));
+        oldBox.Enabled = settings.KeepRobloxUpdated;
+
         add(Theme.Lbl("CLIENTS", 9, Theme.Gold, true), D(28));
         var row = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Theme.Bg };
         row.Controls.Add(Theme.Btn("Tile Roblox windows across my monitors", Theme.Card, (s, e) => TileWindows()));
-        row.Controls.Add(Theme.Btn("Open data folder", Theme.Card, (s, e) => { Directory.CreateDirectory(Store.Dir); Process.Start("explorer.exe", Store.Dir); }));
+        row.Controls.Add(Theme.Btn("Open data folder", Theme.Card, (s, e) => { Directory.CreateDirectory(Store.Dir); using (Program.StartNormal(new ProcessStartInfo("explorer.exe", "\"" + Store.Dir + "\""))) { } }));
         add(row, D(60));
+        add(check("Clean up leftover crash handlers (off by default): close RobloxCrashHandler programs left behind after their Roblox client closed. Never touches one whose client is still running.",
+                  settings.CleanCrashHandlers, v => { settings.CleanCrashHandlers = v; Store.SaveSettings(settings); }), D(56));
+
+        add(Theme.Lbl("WINDOWS", 9, Theme.Gold, true), D(28));
+        add(check("Close to tray (off by default): ✕ hides Multi Alt next to the clock and keeps your clients running. Double-click the tray icon to open it, right-click it to exit.",
+                  settings.CloseToTray, v => { settings.CloseToTray = v; Store.SaveSettings(settings); }), D(56));
+        add(check("Show in Start Menu (off by default): add Multi Alt to the Start Menu so Windows search finds it. Unticking removes it.",
+                  settings.StartMenuShortcut, v =>
+                  {
+                      settings.StartMenuShortcut = v; Store.SaveSettings(settings);
+                      try { Program.SetStartMenu(v); status.Text = v ? "Added Multi Alt to the Start Menu." : "Removed Multi Alt from the Start Menu."; }
+                      catch (Exception ex) { status.Text = "Start Menu shortcut: " + ex.Message; }
+                  }), D(56));
 
         add(Theme.Lbl("ABOUT", 9, Theme.Gold, true), D(28));
         add(Theme.Lbl("Multi Alt v" + Program.Version + "  —  by Triple DDD", 12, Theme.Fg, true), D(32));
@@ -1903,20 +2455,27 @@ These terms may be updated with new versions of the Software. Continuing to use 
         foreach (var name in new[] { "RobloxPlayerLauncher", "RobloxPlayerBeta" })
             foreach (var pr in Process.GetProcessesByName(name))
                 try { pr.Kill(); pr.WaitForExit(3000); } catch { } finally { pr.Dispose(); }
+        try { Program.SetStartMenu(false); } catch { }
 
         var left = new List<string>();
         if (burn)
         {
+            Store.Frozen = true; // the goodbye box below still runs queued work: none of it may save
             left = Store.Burn();
             try { Clipboard.Clear(); } catch { }
         }
+        else try { if (Directory.Exists(Store.AvatarDir)) Directory.Delete(Store.AvatarDir, true); } catch { } // only a cache of profile pictures
+        bool selfDelete = exe.IndexOf('%') < 0; // cmd would read %...% in the path as a variable: then you delete it by hand
         MessageBox.Show((burn ? "All Multi Alt data was burned." : "Multi Alt will be deleted. Your data is kept in " + Store.Dir + ".")
                         + (left.Count > 0 ? "\n\nCouldn't fully remove (delete by hand):\n" + string.Join("\n", left) : "")
+                        + (selfDelete ? "" : "\n\nDelete this file by hand once Multi Alt closes:\n" + exe)
                         + (burn ? "\n\nTip: on roblox.com go to Settings > Security > \"Log out of all other sessions\" on each account so old logins stop working everywhere." : "")
                         + "\n\nGoodbye!", "Multi Alt");
+        DisposeTray(); // Environment.Exit skips FormClosed
         // the exe can't delete itself while running: a hidden cmd waits ~2s for us to exit, then deletes it.
         // Started after the message box so a slow click on OK can't make it run while the exe is still open.
-        Process.Start(new ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 > nul & del /f /q \"" + exe + "\"") { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden });
+        if (selfDelete)
+            Process.Start(new ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 > nul & del /f /q \"" + exe + "\"") { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden });
         Environment.Exit(0);
     }
 
@@ -1967,7 +2526,7 @@ static class Program
         return s == null ? null : Image.FromStream(s);
     }
 
-    public const string Version = "1.1.0";
+    public const string Version = "1.2.0";
 
     // Game link box -> PlaceLauncher query. "" -> "" (Roblox home), place ID or game link -> RequestGame,
     // link with privateServerLinkCode -> RequestPrivateGame, anything else -> null.
@@ -2015,12 +2574,95 @@ static class Program
         return to;
     }
 
+    // Fingerprint of the Terms text. Line endings don't count, so a checkout with CRLF and one with LF give the same result.
+    public static string TermsHash(string text)
+    {
+        using (var sha = SHA256.Create()) return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(text.Replace("\r\n", "\n")))).Replace("-", "");
+    }
+
     public static bool RamAllowed(int gb, long installedBytes) { return gb == 0 || gb <= Math.Ceiling(installedBytes / (double)GB); }
+
+    // True when at least `seconds` passed since last (or the clock went back).
+    public static bool Due(DateTime last, DateTime now, int seconds) { return now < last || now - last >= TimeSpan.FromSeconds(seconds); }
+
+    // A child is left behind when its parent is gone, or the parent's PID now belongs to a program that started after it.
+    public static bool IsOrphan(DateTime childStart, DateTime? parentStart) { return parentStart == null || parentStart.Value > childStart; }
+
+    public const string AdminWarning = "Run Multi Alt normally, not as admin, to avoid duplicate Roblox installs.";
+    public static bool Elevated()
+    {
+        try
+        {
+            using (var id = System.Security.Principal.WindowsIdentity.GetCurrent())
+                return new System.Security.Principal.WindowsPrincipal(id).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch { return false; }
+    }
+
+    // Multi Alt runs at below-normal priority and Windows hands that down to whatever it starts, so lift it for the moment
+    // of the start: Roblox, the installer and browsers start at normal priority.
+    static readonly object startGate = new object();
+    public static Process StartNormal(ProcessStartInfo psi)
+    {
+        lock (startGate)
+            using (var me = Process.GetCurrentProcess())
+            {
+                var old = ProcessPriorityClass.Normal;
+                try { old = me.PriorityClass; if (old != ProcessPriorityClass.Normal) me.PriorityClass = ProcessPriorityClass.Normal; } catch { }
+                try { return Process.Start(psi); }
+                finally { try { if (old != ProcessPriorityClass.Normal) me.PriorityClass = old; } catch { } }
+            }
+    }
+
+    // "Show in Start Menu": a normal per-user shortcut (so Windows search finds Multi Alt), made by the Windows shell object.
+    public static readonly string StartMenuLink = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Multi Alt.lnk");
+    public static void SetStartMenu(bool on)
+    {
+        if (!on) { if (File.Exists(StartMenuLink)) File.Delete(StartMenuLink); return; }
+        object shell = null, link = null;
+        try
+        {
+            var t = Type.GetTypeFromProgID("WScript.Shell", true);
+            shell = Activator.CreateInstance(t);
+            link = t.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { StartMenuLink });
+            var lt = link.GetType();
+            var exe = Application.ExecutablePath;
+            lt.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, link, new object[] { exe });
+            lt.InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, link, new object[] { Path.GetDirectoryName(exe) });
+            lt.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty, null, link, new object[] { exe + ",0" });
+            lt.InvokeMember("Description", System.Reflection.BindingFlags.SetProperty, null, link, new object[] { "Run many Roblox accounts at once" });
+            lt.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, link, null);
+        }
+        finally
+        {
+            if (link != null) Marshal.FinalReleaseComObject(link);
+            if (shell != null) Marshal.FinalReleaseComObject(shell);
+        }
+    }
+
+    // Set by a second copy of Multi Alt to bring this one to the front instead of running twice.
+    public static EventWaitHandle ShowSignal;
+    static Mutex instance;
+    [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
 
     [STAThread]
     static int Main(string[] args)
     {
         if (args.Length > 0 && args[0] == "--selftest") return SelfTest();
+
+        // One Multi Alt at a time (two would overwrite each other's saved accounts): a second copy shows the first one.
+        bool first;
+        try { instance = new Mutex(true, @"Local\MultiAlt_Instance", out first); }
+        catch (UnauthorizedAccessException) { first = false; } // held by a copy running as admin
+        catch { first = true; }
+        if (!first)
+        {
+            try { AllowSetForegroundWindow(-1); using (var ev = EventWaitHandle.OpenExisting(@"Local\MultiAlt_Show")) ev.Set(); }
+            catch { MessageBox.Show("Multi Alt is already running. Look for its icon next to the clock.", "Multi Alt"); }
+            return 0;
+        }
+        try { ShowSignal = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\MultiAlt_Show"); } catch { }
+        try { using (var me = Process.GetCurrentProcess()) me.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { } // games come first
 
         // Each Roblox client claims "ROBLOX_singletonEvent" (older builds: ...Mutex) and quits if another client has it.
         // Owning both names first as mutexes means no client can claim them, so all of them run.
@@ -2041,6 +2683,8 @@ static class Program
         using (var g = Graphics.FromHwnd(IntPtr.Zero)) Theme.S = g.DpiX / 96f;
         Application.EnableVisualStyles();
 
+        if (!MainForm.AgreeToTerms(Store.LoadSettings())) return 0; // "I don't agree" or closed: nothing else runs
+
         List<Account> accounts;
         try { accounts = Store.Load(); }
         catch (Exception ex)
@@ -2052,6 +2696,7 @@ static class Program
         Application.Run(new MainForm(accounts));
         GC.KeepAlive(singleton);
         GC.KeepAlive(singletonOld);
+        GC.KeepAlive(instance);
         return 0;
     }
 
@@ -2108,6 +2753,44 @@ static class Program
 
         long ram16 =16L * GB - 300L * 1024 * 1024; // what Windows reports for a "16 GB" PC
         Check(Program.RamAllowed(16, ram16) && !Program.RamAllowed(24, ram16) && Program.RamAllowed(0, ram16), "ram options");
+
+        // v1.2: names from the network or the registry only become folder paths when they're exactly "version-" + 16 hex
+        const string V = "version-0123456789abcdef";
+        Check(RobloxInstall.IsVersionName(V) && !RobloxInstall.IsVersionName(V + "\n") && !RobloxInstall.IsVersionName("version-0123456789abcde")
+              && !RobloxInstall.IsVersionName(V + "0") && !RobloxInstall.IsVersionName(@"..\" + V) && !RobloxInstall.IsVersionName(null)
+              && !RobloxInstall.IsVersionName("version-0123456789ABCDEF"), "version name");
+        Check(RobloxInstall.ParseLive("{\"version\":\"0.700.0.7000000\",\"clientVersionUpload\":\"" + V + "\"}") == V
+              && RobloxInstall.ParseLive("{\"clientVersionUpload\":\"..\\\\..\\\\x\"}") == null && RobloxInstall.ParseLive("junk") == null
+              && RobloxInstall.ParseLive("{}") == null && RobloxInstall.ParseLive(null) == null, "live version parse");
+        Check(RobloxInstall.SafeArg(RobloxApi.BuildUri("abc-DEF_123", G + "1818")) && RobloxInstall.SafeArg(RobloxApi.BuildUri("abc", ""))
+              && !RobloxInstall.SafeArg("roblox-player:1 --x") && !RobloxInstall.SafeArg("a\"b") && !RobloxInstall.SafeArg("") && !RobloxInstall.SafeArg(null), "launch arg");
+
+        var d0 = new DateTime(2026, 1, 1, 12, 0, 0);
+        Check(!Due(d0, d0.AddSeconds(29), 30) && Due(d0, d0.AddSeconds(30), 30) && Due(DateTime.MinValue, d0, 30) && Due(d0, d0.AddSeconds(-5), 30), "every 30 s");
+        Check(IsOrphan(d0, null) && IsOrphan(d0, d0.AddSeconds(1)) && !IsOrphan(d0, d0.AddSeconds(-1)) && !IsOrphan(d0, d0), "crash handler orphan");
+
+        Func<string, bool, bool, bool, RobloxInstall.VersionDir> vd = (n, pl, st, ln) => new RobloxInstall.VersionDir { Name = n, Player = pl, Studio = st, Link = ln };
+        var old = RobloxInstall.PickOld(new[] {
+            vd("version-0000000000000001", true, false, false),  // live: kept
+            vd("version-0000000000000002", true, true, false),   // Studio: kept
+            vd("version-0000000000000003", true, false, false),  // old player: removed
+            vd("version-0000000000000004", true, false, true),   // a link: kept
+            vd("version-0000000000000005", false, false, false), // no player: kept
+            vd("Version-0000000000000006", true, false, false),  // not a Roblox folder name: kept
+            vd("version-0000000000000007", true, false, false),  // what Roblox links open: kept
+        }, new[] { "version-0000000000000001", null, "VERSION-0000000000000007" });
+        Check(old.Count == 1 && old[0] == "version-0000000000000003", "old versions");
+
+        Check(RobloxInstall.CommandExe("\"C:\\R\\" + V + "\\RobloxPlayerBeta.exe\" %1") == "C:\\R\\" + V + "\\RobloxPlayerBeta.exe"
+              && RobloxInstall.CommandExe("C:\\B\\Bloxstrap.exe -player \"%1\"") == "C:\\B\\Bloxstrap.exe" && RobloxInstall.CommandExe(null) == null
+              && RobloxInstall.CommandExe("") == null, "registry command");
+        Check(RobloxInstall.VersionOf("C:\\R\\" + V + "\\RobloxPlayerBeta.exe", "C:\\R") == V && RobloxInstall.VersionOf("c:\\r\\" + V + "\\a.exe", "C:\\R\\") == V
+              && RobloxInstall.VersionOf("C:\\X\\" + V + "\\RobloxPlayerBeta.exe", "C:\\R") == null && RobloxInstall.VersionOf("C:\\R\\" + V + "\\sub\\a.exe", "C:\\R") == null
+              && RobloxInstall.VersionOf("C:\\R\\..\\X\\" + V + "\\a.exe", "C:\\R") == null && RobloxInstall.VersionOf(null, "C:\\R") == null
+              && RobloxInstall.VersionOf(RobloxInstall.CommandExe("\"C:\\R\\" + V + "\\RobloxPlayerInstaller.exe\" -uninstall"), "C:\\R") == V, "version folder");
+        Check(TermsHash("a\r\nb") == TermsHash("a\nb") && TermsHash("a\nb") != TermsHash("a\nc") && TermsHash("x").Length == 64, "terms hash");
+        Check(new AppSettings().AcceptedTerms == null && MainForm.AgreeToTerms(new AppSettings { AcceptedTerms = MainForm.TermsId }), "terms agreed once, not asked again");
+
         Console.WriteLine("selftest ok");
         return 0;
     }
